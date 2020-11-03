@@ -39,7 +39,9 @@ jobs:
               repo: context.repo.repo,
               title: "ed25519 upstream has new commits",
               body: "It seems https://github.com/pyca/ed25519.git has new commits. " +
-                    "Please review them, update the vendored copy if needed, and then " +
+                    "Please review them, update the vendored copy if needed(" +
+                    "[README](" + context.repo.url +
+                    "/blob/master/securesystemslib/_vendor/README.md)), and then " +
                     "update the expected hash in _vendor/test-ed25519-upstream.sh"
             })
           }
