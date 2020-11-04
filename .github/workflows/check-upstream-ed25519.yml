@@ -15,13 +15,13 @@ jobs:
       id: test_ed25519
       run: |
         if sh securesystemslib/_vendor/test-ed25519-upstream.sh; then
-          echo "::set-output name=result::0"
+          echo "test_upstream_result=0" >> $GITHUB_ENV
         else
-          echo "::set-output name=result::1"
+          echo "test_upstream_result=1" >> $GITHUB_ENV
         fi
     - name: Create issue (unless one is open already)
       uses: actions/github-script@v3
-      if: ${{ steps.test_ed25519.outputs.result == '1' }}
+      if: ${{ env.test_upstream_result == '1' }}
       with:
         script: |
           console.log("ed25519 upstream master has changed!")
