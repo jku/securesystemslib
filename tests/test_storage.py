@@ -61,9 +61,11 @@ class TestStorage(unittest.TestCase):
 
     self.assertRaises(securesystemslib.exceptions.StorageError,
         self.storage_backend.getsize, '/none/existent/path')
+    print("create /none/existent/path/ ...")
 
     self.assertRaises(securesystemslib.exceptions.StorageError,
-        self.storage_backend.create_folder, '/none/existent/path')
+        self.storage_backend.create_folder, os.path.normpath('/none/existent/path'))
+    print("create '' ...")
 
     self.assertRaises(securesystemslib.exceptions.StorageError,
         self.storage_backend.create_folder, '')
@@ -112,3 +114,6 @@ class TestStorage(unittest.TestCase):
     self.assertEqual(id(fb1), id(fb2))
     self.assertEqual(id(self.storage_backend), id(fb1))
     self.assertEqual(id(fb2), id(self.storage_backend))
+
+if __name__ == "__main__":
+  unittest.main()

@@ -270,6 +270,7 @@ class FilesystemBackend(StorageBackendInterface):
   def create_folder(self, filepath):
     try:
       os.makedirs(filepath)
+      print (filepath, os.path.isdir(filepath))
     except OSError as e:
       # 'OSError' raised if the leaf directory already exists or cannot be
       # created. Check for case where 'filepath' has already been created and
