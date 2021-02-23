@@ -14,8 +14,8 @@ jobs:
       # Run tests on each OS/Python combination
       matrix:
         python-version: [2.7, 3.6, 3.7, 3.8, 3.9]
-        # TODO: Add windows-latest when gpg issues are solved
-        os: [ubuntu-latest, macos-latest]
+        # TESTING
+        os: [windows-latest]
         toxenv: [py]
 
         include:
