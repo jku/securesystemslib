@@ -117,7 +117,7 @@ def create_signature(content, keyid=None, homedir=None):
   command = GPG_SIGN_COMMAND.format(keyarg=keyarg, homearg=homearg)
 
   gpg_process = process.run(command, input=content, check=False,
-      stdout=process.PIPE, stderr=process.PIPE)
+      stdout=process.PIPE, stderr=process.PIPE, timeout=None)
 
   # TODO: It's suggested to take a look at `--status-fd` for proper error
   # reporting, as there is no clear distinction between the return codes
