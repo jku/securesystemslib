@@ -19,16 +19,6 @@ jobs:
           workload_identity_provider: 'projects/367732848534/locations/global/workloadIdentityPools/securesystemslib-test-pool/providers/securesystemslib-test-provider'
           service_account: 'securesystemslib-test@openssf.iam.gserviceaccount.com'
 
-      - name: 'Set up GCP'
-        uses: 'google-github-actions/setup-gcloud@ee9693ff89cdf73862b8a13988f6a71070e8fc58'
-
-      - name: 'Login to GCP'
-        run: |
-          gcloud auth login --brief --cred-file="${{ steps.auth.outputs.credentials_file_path }}"
-          gcloud auth list
-
-      - uses: 'actions/setup-python@v4'
-
       - name: 'Sign with KMS key'
         run: |
           pip install google-cloud-kms
