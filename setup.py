@@ -102,6 +102,7 @@ setup(
     extras_require={
         "crypto": ["cryptography>=37.0.0"],
         "pynacl": ["pynacl>1.2.0"],
+        "gcpkms": ["google-cloud-kms"],
     },
     packages=find_packages(exclude=["tests", "debian"]),
     scripts=[],

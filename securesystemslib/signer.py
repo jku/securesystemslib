@@ -6,10 +6,23 @@ signing implementations and a couple of example implementations.
 """
 
 import abc
+import logging
 from typing import Any, Dict, Mapping, Optional
 
 import securesystemslib.gpg.functions as gpg
+import securesystemslib.hash as sslib_hash
 import securesystemslib.keys as sslib_keys
+from securesystemslib import exceptions
+
+logger = logging.getLogger(__name__)
+
+GCP_IMPORT_ERROR = None
+try:
+    from google.cloud import kms
+except ImportError:
+    GCP_IMPORT_ERROR = (
+        "google-cloud-kms library required to sign with Google Cloud keys."
+    )
 
 
 class Signature:
@@ -266,3 +279,36 @@ class GPGSigner(Signer):
 
         sig_dict = gpg.create_signature(payload, self.keyid, self.homedir)
         return GPGSignature(**sig_dict)
+
+
+class GCPSigner(Signer):
+    """Google Cloud KMS Signer
+
+    There is no way to input Google Cloud credentials: assumption is that they will
+    be found in the runtime environment by google.cloud.kms, see
+    https://cloud.google.com/docs/authentication/getting-started
+    """
+
+    def __init__(self, gcp_keyid: str, hash_algo: str, keyid: str):
+        if GCP_IMPORT_ERROR:
+            raise exceptions.UnsupportedLibraryError(GCP_IMPORT_ERROR)
+
+        self.gcp_keyid = gcp_keyid
+        self.hash_algo = hash_algo
+        self.keyid = keyid
+        self.client = kms.KeyManagementServiceClient()
+
+    def sign(self, payload: bytes) -> Signature:
+        # NOTE: request and response can contain CRC32C of the digest/sig:
+        # This could be useful but would require another dependency...
+
+        hasher = sslib_hash.digest(self.hash_algo)
+        hasher.update(payload)
+        digest = {self.hash_algo: hasher.digest()}
+        request = {"name": self.gcp_keyid, "digest": digest}
+
+        logger.debug("signing request %s", request)
+        response = self.client.asymmetric_sign(request)
+        logger.debug("signing response %s", response)
+
+        return Signature(self.keyid, response.signature.hex())

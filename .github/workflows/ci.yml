@@ -28,8 +28,14 @@ jobs:
           - python-version: 3.8
             os: ubuntu-latest
             toxenv: lint
+          - python-version: 3.x
+            os: ubuntu-latest
+            toxenv: kms
 
     runs-on: ${{ matrix.os }}
+
+    permissions:
+      id-token: 'write' # for OIDC auth for GCP authentication
 
     steps:
       - name: Checkout securesystemslib
@@ -54,6 +60,15 @@ jobs:
           # A match with 'restore-keys' is used as fallback
           restore-keys: ${{ runner.os }}-pip-
 
+      - name: 'Authenticate to Google Cloud'
+        # Authenticate to GCP KMS, but only if we're running KMS tests
+        if: ${{ matrix.toxenv == 'kms' }}
+        uses: 'google-github-actions/auth@c4799db9111fba4461e9f9da8732e5057b394f72'
+        with:
+          token_format: 'access_token'
+          workload_identity_provider: 'projects/843741030650/locations/global/workloadIdentityPools/securesystemslib-tests/providers/securesystemslib-tests'
+          service_account: 'securesystemslib-tests@python-tuf-kms.iam.gserviceaccount.com'
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -61,4 +76,3 @@ jobs:
 
       - name: Run tox
         run: tox -e ${{ matrix.toxenv }}
-
