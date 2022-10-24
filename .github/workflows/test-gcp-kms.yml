@@ -15,7 +15,7 @@ jobs:
         id: 'auth'
         uses: 'google-github-actions/auth@c4799db9111fba4461e9f9da8732e5057b394f72'
         with:
-          token_format: 'id_token'
+          token_format: 'access_token'
           workload_identity_provider: 'projects/367732848534/locations/global/workloadIdentityPools/securesystemslib-test-pool/providers/securesystemslib-test-provider'
           service_account: 'securesystemslib-test@openssf.iam.gserviceaccount.com'
 
