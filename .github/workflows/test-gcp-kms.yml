@@ -27,6 +27,11 @@ jobs:
           gcloud auth login --brief --cred-file="${{ steps.auth.outputs.credentials_file_path }}"
           gcloud auth list
 
+      - uses: 'actions/setup-python@v4'
+
       - name: 'Sign with KMS key'
-        run: "echo TODO"
+        run: |
+          pip install google-cloud-kms
+          python3 test-sign.py openssf global securesystemslib-test-keyring securesystemslib-test-key 1
+
 
