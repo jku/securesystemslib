@@ -12,13 +12,21 @@ jobs:
     steps:
       - uses: 'actions/checkout@93ea575cb5d8a053eaa0ac8fa3b40d7e05a33cc8'
       - name: 'Authenticate to Google Cloud'
+        id: 'auth'
         uses: 'google-github-actions/auth@c4799db9111fba4461e9f9da8732e5057b394f72'
         with:
+          token_format: 'id_token'
           workload_identity_provider: 'projects/367732848534/locations/global/workloadIdentityPools/securesystemslib-test-pool/providers/securesystemslib-test-provider'
           service_account: 'securesystemslib-test@openssf.iam.gserviceaccount.com'
 
-      - name: 'Set up Cloud SDK'
+      - name: 'Set up GCP'
         uses: 'google-github-actions/setup-gcloud@ee9693ff89cdf73862b8a13988f6a71070e8fc58'
 
-      - name: 'Use gcloud CLI'
-        run: 'gcloud info'
+      - name: 'Login to GCP'
+        run: |
+          gcloud auth login --brief --cred-file="${{ steps.auth.outputs.credentials_file_path }}"
+          gcloud auth list
+
+      - name: 'Sign with KMS key'
+        run: "echo TODO"
+
