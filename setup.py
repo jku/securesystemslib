@@ -101,6 +101,7 @@ setup(
     python_requires="~=3.7",
     extras_require={
         "crypto": ["cryptography>=37.0.0"],
+        "gcpkms": ["google-cloud-kms"],
         "pynacl": ["pynacl>1.2.0"],
         "PySPX": ["PySPX==0.5.0"],
     },

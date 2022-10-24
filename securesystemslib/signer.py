@@ -6,10 +6,23 @@ signing implementations and a couple of example implementations.
 """
 
 import abc
+import logging
 from typing import Any, Dict, Mapping, Optional
 
 import securesystemslib.gpg.functions as gpg
+import securesystemslib.hash as sslib_hash
 import securesystemslib.keys as sslib_keys
+from securesystemslib import exceptions
+
+logger = logging.getLogger(__name__)
+
+GCP_IMPORT_ERROR = None
+try:
+    from google.cloud import kms
+except ImportError:
+    GCP_IMPORT_ERROR = (
+        "google-cloud-kms library required to sign with Google Cloud keys."
+    )
 
 
 class Signature:
@@ -266,3 +279,69 @@ class GPGSigner(Signer):
 
         sig_dict = gpg.create_signature(payload, self.keyid, self.homedir)
         return GPGSignature(**sig_dict)
+
+
+class GCPSigner(Signer):
+    """Google Cloud KMS Signer
+
+    This Signer uses Google Cloud KMS to sign: the payload is hashed locally,
+    but the signature is created on the KMS.
+
+    The signer uses "ambient" credentials: typically environment var
+    GOOGLE_APPLICATION_CREDENTIALS that points to a file with valid
+    credentials. These will be found by google.cloud.kms, see
+    https://cloud.google.com/docs/authentication/getting-started
+    (and https://github.com/google-github-actions/auth for the relevant
+    GitHub action).
+
+    Arguments:
+        gcp_keyid: Fully qualified GCP KMS key name, like
+            projects/python-tuf-kms/locations/global/keyRings/securesystemslib-tests/cryptoKeys/ecdsa-sha2-nistp256/cryptoKeyVersions/1
+        hash_algo: Payload hashing algorithm
+        keyid: The keyid to be used in the returned Signature
+
+    Raises:
+        UnsupportedAlgorithmError: The payload hash algorithm is unsupported.
+        UnsupportedLibraryError: google.cloud.kms was not found
+        Various errors from google.cloud modules: e.g.
+            google.auth.exceptions.DefaultCredentialsError if ambient
+            credentials are not found
+    """
+
+    def __init__(self, gcp_keyid: str, hash_algo: str, keyid: str):
+        if GCP_IMPORT_ERROR:
+            raise exceptions.UnsupportedLibraryError(GCP_IMPORT_ERROR)
+
+        self.hash_algo = hash_algo
+        # trigger exception if algorithm is unsupported
+        _ = sslib_hash.digest(self.hash_algo)
+
+        self.gcp_keyid = gcp_keyid
+        self.keyid = keyid
+        self.client = kms.KeyManagementServiceClient()
+
+    def sign(self, payload: bytes) -> Signature:
+        """Signs payload with Google Cloud KMS.
+
+        Arguments:
+            payload: bytes to be signed.
+
+        Raises:
+            Various errors from google.cloud modules.
+
+        Returns:
+            Signature.
+        """
+        # NOTE: request and response can contain CRC32C of the digest/sig:
+        # Verifying could be useful but would require another dependency...
+
+        hasher = sslib_hash.digest(self.hash_algo)
+        hasher.update(payload)
+        digest = {self.hash_algo: hasher.digest()}
+        request = {"name": self.gcp_keyid, "digest": digest}
+
+        logger.debug("signing request %s", request)
+        response = self.client.asymmetric_sign(request)
+        logger.debug("signing response %s", response)
+
+        return Signature(self.keyid, response.signature.hex())
