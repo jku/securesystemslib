@@ -12,13 +12,14 @@ from urllib import parse
 import securesystemslib.hash as sslib_hash
 from securesystemslib import exceptions
 from securesystemslib.signer._key import Key
-from securesystemslib.signer._signer import SecretsHandler, Signature, Signer
+from securesystemslib.signer._signer import SecretsHandler, Signature, Signer, SSlibKey
 
 logger = logging.getLogger(__name__)
 
 GCP_IMPORT_ERROR = None
 try:
     from google.cloud import kms
+    from google.cloud.kms_v1.types import CryptoKeyVersion
 except ImportError:
     GCP_IMPORT_ERROR = (
         "google-cloud-kms library required to sign with Google Cloud keys."
@@ -41,7 +42,9 @@ class GCPSigner(Signer):
     Arguments:
         gcp_keyid: Fully qualified GCP KMS key name, like
             projects/python-tuf-kms/locations/global/keyRings/securesystemslib-tests/cryptoKeys/ecdsa-sha2-nistp256/cryptoKeyVersions/1
-        public_key: The related public key instance
+        public_key: The related public key instance. If public_key is None,
+            it will be requested from the KMS (this requires viewPublicKey
+            permission)
 
     Raises:
         UnsupportedAlgorithmError: The payload hash algorithm is unsupported.
@@ -53,14 +56,48 @@ class GCPSigner(Signer):
 
     SCHEME = "gcpkms"
 
-    def __init__(self, gcp_keyid: str, public_key: Key):
+    def __init__(self, gcp_keyid: str, public_key: Optional[Key]):
         if GCP_IMPORT_ERROR:
             raise exceptions.UnsupportedLibraryError(GCP_IMPORT_ERROR)
 
-        self.hash_algorithm = self._get_hash_algorithm(public_key)
         self.gcp_keyid = gcp_keyid
-        self.public_key = public_key
         self.client = kms.KeyManagementServiceClient()
+
+        self.public_key = public_key
+        if self.public_key is None:
+            self.public_key = self._get_public_key()
+
+        self.hash_algorithm = self._get_hash_algorithm(self.public_key)
+
+    def _get_public_key(self) -> Key:
+        """Load public key from KMS using ambient credentials
+
+        This requires "viewPublicKey" permission in Google Cloud KMS.
+        """
+        kms_algo = CryptoKeyVersion.CryptoKeyVersionAlgorithm
+        kms_keytypes = {
+            kms_algo.EC_SIGN_P256_SHA256: ("ecdsa-sha2-nistp256", "ecdsa-sha2-nistp256"),
+            kms_algo.EC_SIGN_P384_SHA384: ("ecdsa-sha2-nistp384", "ecdsa-sha2-nistp384"),
+            kms_algo.RSA_SIGN_PSS_2048_SHA256: ("rsa", "rsassa-pss-sha256"),
+            kms_algo.RSA_SIGN_PSS_3072_SHA256: ("rsa", "rsassa-pss-sha256"),
+            kms_algo.RSA_SIGN_PSS_4096_SHA256: ("rsa", "rsassa-pss-sha256"),
+            kms_algo.RSA_SIGN_PSS_4096_SHA512: ("rsa", "rsassa-pss-sha512"),
+            kms_algo.RSA_SIGN_PKCS1_2048_SHA256: ("rsa", "rsa-pkcs1v15-sha256"),
+            kms_algo.RSA_SIGN_PKCS1_3072_SHA256: ("rsa", "rsa-pkcs1v15-sha256"),
+            kms_algo.RSA_SIGN_PKCS1_4096_SHA256: ("rsa", "rsa-pkcs1v15-sha256"),
+            kms_algo.RSA_SIGN_PKCS1_4096_SHA512: ("rsa", "rsa-pkcs1v15-sha512"),
+        }
+
+        request = {"name": self.gcp_keyid}
+        kms_pubkey = self.client.get_public_key(request)
+        try:
+            keytype, scheme = kms_keytypes[kms_pubkey.algorithm]
+        except KeyError:
+            raise exceptions.UnsupportedAlgorithmError(
+                f"{kms_pubkey.algorithm} is not a supported signing algorithm"
+            )
+
+        return SSlibKey("THIS SURE IS A KEYID", keytype, scheme, {"public": kms_pubkey.pem})
 
     @classmethod
     def from_priv_key_uri(
