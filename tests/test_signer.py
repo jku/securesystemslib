@@ -1,5 +1,7 @@
 """Test cases for "signer.py"."""
 
+from __future__ import annotations
+
 import copy
 import os
 import shutil
