@@ -111,32 +111,18 @@ def _sign_on_tkey(conn: serial.Serial, formatted_msg: bytes) -> bytes:
         offset += 127
 
     # 3. Trigger signing (blocks waiting for physical touch)
-    # NOTE: We manually construct the GetSig frame and handle the blocking read instead of
-    # calling proto.send_command(conn, cmdGetSig, proto.ENDPOINT_APP, id).
-    # This is to avoid a bug in tkeyclient-py where keeping conn.timeout = 60 during the
-    # entire read_frame() call causes severe serial read slowness on POSIX platforms.
-    # By reading the first byte blockingly (which waits for touch) and then immediately
-    # restoring the default timeout before reading the bulk of the response payload,
-    # we get instantaneous signature retrieval.
-    trigger_sign_frame = bytearray([0x58, 0x07])
-    conn.write(trigger_sign_frame)
-
     old_timeout = conn.timeout
     conn.timeout = 60
     try:
-        header_byte = conn.read(1)
-        if len(header_byte) == 0:
-            raise error.TKeyReadError("No response data")
-
-        # Read the remaining 128 bytes of RSP_GET_SIG response frame (RSP code + payload)
-        # We must read ALL bytes before restoring the timeout to prevent USB control race conditions!
-        remaining_rx = conn.read(128)
+        rx = proto.send_command(conn, cmdGetSig, proto.ENDPOINT_APP, id)
     finally:
         conn.timeout = old_timeout
 
-    if len(remaining_rx) < 128 or remaining_rx[0] != 0x08 or remaining_rx[1] != 0x00:
+    # Validate response format:
+    # header_byte (1) + RSP_GET_SIG ID (1) + status_byte (1) + data (126) = 129
+    if len(rx) < 129 or rx[1] != 0x08 or rx[2] != 0x00:
         raise error.TKeyProtocolError(
-            f"Response mismatch: len={len(remaining_rx)} hex={remaining_rx.hex()}"
+            f"Response mismatch or NOK status: len={len(rx)} hex={rx.hex()}"
         )
 
     # 4. Fetch signature chunks (21 chunks)
