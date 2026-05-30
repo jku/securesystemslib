@@ -28,7 +28,7 @@ from securesystemslib.signer._signature import Signature
 from securesystemslib.signer._signer import SecretsHandler, Signer
 
 if TYPE_CHECKING:
-    import serial
+    import serial  # type: ignore[import-untyped]
 
 
 logger = logging.getLogger(__name__)
@@ -57,25 +57,28 @@ if not TKEYCLIENT_IMPORT_ERROR:
     rspGetNameVersion = proto.fwCommand(0x0A, 2)  # LEN_32
 
 
-def _get_app_name_version(conn: serial.Serial) -> tuple[str, str, int]:
+def _get_app_name_version(conn: Any) -> tuple[str, str, int]:
     """Query name and version from the running signer application (ENDPOINT_APP)."""
-    id = 2
-    rx:bytes = proto.send_command(conn, cmdGetNameVersion, proto.ENDPOINT_APP, id)
+    fid = 0
+    rx: bytes = proto.send_command(
+        conn, cmdGetNameVersion, proto.ENDPOINT_APP, fid
+    )
     name0 = rx[2:6].decode("ascii", errors="ignore").rstrip()
     name1 = rx[6:10].decode("ascii", errors="ignore").rstrip()
     version = int.from_bytes(rx[10:14], byteorder="little")
     return name0, name1, version
 
 
-def _get_pubkey_from_tkey(conn: serial.Serial) -> bytes:
+def _get_pubkey_from_tkey(conn: Any) -> bytes:
     """Retrieve 1312-byte ML-DSA-44 public key from device in 120-byte chunks."""
-    id = 2
+    fid = 0
     pubkey = bytearray(1312)
     for i in range(11):
         tx_data = bytes([i, 0, 0])  # 1 byte chunk index + 2 bytes padding
         rx = proto.send_command(
-            conn, cmdGetPubkeyChunk, proto.ENDPOINT_APP, id, tx_data
+            conn, cmdGetPubkeyChunk, proto.ENDPOINT_APP, fid, tx_data
         )
+        fid = (fid + 1) % 4
 
         if rx[2] != 0:
             raise ValueError(f"GetPubkeyChunk NOK status: {rx[2]}")
@@ -90,16 +93,17 @@ def _get_pubkey_from_tkey(conn: serial.Serial) -> bytes:
     return bytes(pubkey)
 
 
-def _sign_on_tkey(conn: serial.Serial, formatted_msg: bytes) -> bytes:
+def _sign_on_tkey(conn: Any, formatted_msg: bytes) -> bytes:
     """Send 68-byte message to TKey, trigger touch-signing, and fetch 2420-byte signature."""
-    id = 2
+    fid = 0
 
     # 1. Set size
     size = len(formatted_msg)
     size_bytes = size.to_bytes(4, byteorder="little")
     tx_data = bytearray(31)
     tx_data[0:4] = size_bytes
-    proto.send_command(conn, cmdSetSize, proto.ENDPOINT_APP, id, bytes(tx_data))
+    proto.send_command(conn, cmdSetSize, proto.ENDPOINT_APP, fid, bytes(tx_data))
+    fid = (fid + 1) % 4
 
     # 2. Load data
     offset = 0
@@ -107,16 +111,18 @@ def _sign_on_tkey(conn: serial.Serial, formatted_msg: bytes) -> bytes:
         chunk = formatted_msg[offset : offset + 127]
         if len(chunk) < 127:
             chunk = chunk + b"\x00" * (127 - len(chunk))
-        proto.send_command(conn, cmdSignData, proto.ENDPOINT_APP, id, chunk)
+        proto.send_command(conn, cmdSignData, proto.ENDPOINT_APP, fid, chunk)
+        fid = (fid + 1) % 4
         offset += 127
 
     # 3. Trigger signing (blocks waiting for physical touch)
     old_timeout = conn.timeout
     conn.timeout = 60
     try:
-        rx = proto.send_command(conn, cmdGetSig, proto.ENDPOINT_APP, id)
+        rx = proto.send_command(conn, cmdGetSig, proto.ENDPOINT_APP, fid)
     finally:
         conn.timeout = old_timeout
+    fid = (fid + 1) % 4
 
     # Validate response format:
     # header_byte (1) + RSP_GET_SIG ID (1) + status_byte (1) + data (126) = 129
@@ -129,8 +135,9 @@ def _sign_on_tkey(conn: serial.Serial, formatted_msg: bytes) -> bytes:
     signature = bytearray(2420)
     for i in range(21):
         rx = proto.send_command(
-            conn, cmdGetSigChunk, proto.ENDPOINT_APP, id, bytes([i, 0, 0])
+            conn, cmdGetSigChunk, proto.ENDPOINT_APP, fid, bytes([i, 0, 0])
         )
+        fid = (fid + 1) % 4
         if rx[2] != 0:
             raise ValueError(f"GetSigChunk NOK status: {rx[2]}")
         if rx[3] != i:
