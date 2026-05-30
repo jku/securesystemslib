@@ -7,7 +7,7 @@ import logging
 import os
 import select
 from importlib.resources import as_file, files
-from typing import Any, TYPE_CHECKING
+from typing import Any
 from urllib import parse
 
 try:
@@ -22,47 +22,216 @@ except ImportError:
 
 from cryptography.hazmat.primitives.asymmetric.mldsa import MLDSA44PublicKey
 
-from securesystemslib.exceptions import UnsupportedLibraryError
+from securesystemslib.exceptions import Error, UnsupportedLibraryError
 from securesystemslib.signer._key import Key, SSlibKey
 from securesystemslib.signer._signature import Signature
 from securesystemslib.signer._signer import SecretsHandler, Signer
 
-if TYPE_CHECKING:
-    import serial  # type: ignore[import-untyped]
-
-
 logger = logging.getLogger(__name__)
 
-TKEYCLIENT_IMPORT_ERROR = None
-try:
-    from tkeyclient import error, hw, proto  # type: ignore[import-untyped]
-    from tkeyclient.tkey import TKey  # type: ignore[import-untyped]
-except ImportError:
-    TKEYCLIENT_IMPORT_ERROR = "Signing with TKey requires the 'tkeyclient' package."
+# Protocol Endpoints
+class Endpoint:
+    FW = 2
+    APP = 3
 
-# --- Isolated TKey Custom Commands & Protocol Logic ---
 
-if not TKEYCLIENT_IMPORT_ERROR:
-    cmdGetPubkeyChunk = proto.fwCommand(0x11, 1)  # LEN_4
-    rspGetPubkeyChunk = proto.fwCommand(0x12, 3)  # LEN_128
-    cmdSetSize = proto.fwCommand(0x03, 2)  # LEN_32
-    rspSetSize = proto.fwCommand(0x04, 1)  # LEN_4
-    cmdSignData = proto.fwCommand(0x05, 3)  # LEN_128
-    rspSignData = proto.fwCommand(0x06, 1)  # LEN_4
-    cmdGetSig = proto.fwCommand(0x07, 0)  # LEN_1
-    rspGetSig = proto.fwCommand(0x08, 3)  # LEN_128
-    cmdGetSigChunk = proto.fwCommand(0x13, 1)  # LEN_4
-    rspGetSigChunk = proto.fwCommand(0x14, 3)  # LEN_128
-    cmdGetNameVersion = proto.fwCommand(0x09, 0)  # LEN_1
-    rspGetNameVersion = proto.fwCommand(0x0A, 2)  # LEN_32
+class Cmd:
+    NAME_VERSION = 0x01
+    LOAD_APP = 0x03
+    LOAD_APP_DATA = 0x05
+    GET_PUBKEY_CHUNK = 0x11
+    SET_SIZE = 0x03
+    SIGN_DATA = 0x05
+    GET_SIG = 0x07
+    GET_SIG_CHUNK = 0x13
+    GET_NAME_VERSION_APP = 0x09
+
+
+class Rsp:
+    NAME_VERSION = 0x02
+    LOAD_APP = 0x04
+    LOAD_APP_DATA = 0x06
+    LOAD_APP_DATA_READY = 0x07
+    GET_PUBKEY_CHUNK = 0x12
+    SET_SIZE = 0x04
+    SIGN_DATA = 0x06
+    GET_SIG = 0x08
+    GET_SIG_CHUNK = 0x14
+    GET_NAME_VERSION_APP = 0x0A
+
+
+# Data lengths corresponding to header length bits (0, 1, 2, 3)
+PROTO_DATA_LENGTH = [1, 4, 32, 128]
+
+# Length indices mapping to PROTO_DATA_LENGTH
+class LenIdx:
+    I1 = 0
+    I4 = 1
+    I32 = 2
+    I128 = 3
+
+# USB Vendor & Product ID for TKey
+USB_VID = 0x1207
+USB_PID = 0x8887
+
+# Maximum size for applications to load onto TKey (100 KiB)
+APP_MAXSIZE = 100 * 1024
+SIG_CHUNKS = 20
+KEY_CHUNKS = 10
+# --- Isolated TKey Exceptions ---
+
+class TKeyError(Error):
+    """Base class for TKey errors."""
+
+
+class TKeyConnectionError(TKeyError):
+    """Raised when a serial connection cannot be opened."""
+
+
+class TKeyWriteError(TKeyError):
+    """Raised when data cannot be written to the device."""
+
+
+class TKeyReadError(TKeyError):
+    """Raised when data cannot be read from the device."""
+
+
+class TKeyStatusError(TKeyError):
+    """Raised when the response status is not OK (NOK)."""
+
+
+class TKeyProtocolError(TKeyError):
+    """Raised upon protocol errors in command or response."""
+
+
+class TKeyLoadError(TKeyError):
+    """Raised if the device failed to load the application."""
+
+
+class TKeyDeviceError(TKeyError):
+    """Raised if the device could not be found."""
+
+
+# --- Standalone TKey Protocol Logic ---
+
+def _validate_response(
+    eid: int, cmd_id: int, resp_id: int, resp_len_idx: int
+) -> None:
+    """Validate response ID and length index matches expected response."""
+    match (eid, cmd_id, resp_id, resp_len_idx):
+        # Firmware Commands
+        case (Endpoint.FW, Cmd.NAME_VERSION, Rsp.NAME_VERSION, LenIdx.I32):
+            pass
+        case (Endpoint.FW, Cmd.LOAD_APP, Rsp.LOAD_APP, LenIdx.I4):
+            pass
+        case (Endpoint.FW, Cmd.LOAD_APP_DATA, Rsp.LOAD_APP_DATA, LenIdx.I4):
+            pass
+        case (Endpoint.FW, Cmd.LOAD_APP_DATA, Rsp.LOAD_APP_DATA_READY, LenIdx.I128):
+            pass
+
+        # Application Commands
+        case (Endpoint.APP, Cmd.GET_PUBKEY_CHUNK, Rsp.GET_PUBKEY_CHUNK, LenIdx.I128):
+            pass
+        case (Endpoint.APP, Cmd.SET_SIZE, Rsp.SET_SIZE, LenIdx.I4):
+            pass
+        case (Endpoint.APP, Cmd.SIGN_DATA, Rsp.SIGN_DATA, LenIdx.I4):
+            pass
+        case (Endpoint.APP, Cmd.GET_SIG, Rsp.GET_SIG, LenIdx.I128):
+            pass
+        case (Endpoint.APP, Cmd.GET_SIG_CHUNK, Rsp.GET_SIG_CHUNK, LenIdx.I128):
+            pass
+        case (
+            Endpoint.APP,
+            Cmd.GET_NAME_VERSION_APP,
+            Rsp.GET_NAME_VERSION_APP,
+            LenIdx.I32,
+        ):
+            pass
+        case _:
+            raise TKeyProtocolError(
+                f"Unexpected protocol response: endpoint={eid:#x}, cmd={cmd_id:#x}, "
+                f"response={resp_id:#x}, len_index={resp_len_idx}"
+            )
+
+
+
+def _send_command(  # noqa: PLR0913
+    conn: Any,
+    cmd_id: int,
+    cmd_len_idx: int,
+    eid: int,
+    fid: int,
+    data: bytes = b"",
+) -> bytes:
+    """Frame and send a command, then read and validate the response."""
+    expected_len = PROTO_DATA_LENGTH[cmd_len_idx]
+    if len(data) > expected_len - 1:
+        raise TKeyProtocolError("Data exceeds command data length in header")
+
+    header = (fid << 5) | (eid << 3) | cmd_len_idx
+    frame = bytearray(1 + expected_len)
+    frame[0] = header
+    frame[1] = cmd_id
+    if data:
+        frame[2 : 2 + len(data)] = data
+
+    try:
+        conn.write(bytes(frame))
+    except Exception as e:
+        raise TKeyWriteError(f"Failed to write frame: {e}") from e
+
+    try:
+        resp_header_byte = conn.read(1)
+    except Exception as e:
+        raise TKeyReadError(f"Failed to read response header: {e}") from e
+
+    if not resp_header_byte:
+        raise TKeyReadError("No response data")
+
+    header_val = resp_header_byte[0]
+    resp_fid = (header_val >> 5) & 3
+    resp_eid = (header_val >> 3) & 3
+    resp_status = (header_val >> 2) & 3
+    resp_len_idx = header_val & 3
+    resp_len = PROTO_DATA_LENGTH[resp_len_idx]
+
+    if resp_status == 1:
+        try:
+            conn.read(resp_len)
+        except Exception as e:
+            logger.debug(
+                "Failed to read remaining bytes after NOK status: %s", e
+            )
+        raise TKeyStatusError("Response status code not OK (1)")
+
+    try:
+        resp_data = conn.read(resp_len)
+    except Exception as e:
+        raise TKeyReadError(f"Failed to read response data: {e}") from e
+
+    if len(resp_data) != resp_len:
+        raise TKeyProtocolError("Unexpected response data length")
+
+    # Validate frame ID and endpoint
+    if resp_fid != fid or resp_eid != eid:
+        raise TKeyProtocolError(
+            f"Response mismatch: expected Frame ID {fid} and Endpoint {eid}, "
+            f"got Frame ID {resp_fid} and Endpoint {resp_eid}"
+        )
+
+    _validate_response(resp_eid, cmd_id, resp_data[0], resp_len_idx)
+
+    response = bytearray(1 + resp_len)
+    response[0] = header_val
+    response[1:] = resp_data
+    return bytes(response)
 
 
 def _get_app_name_version(conn: Any) -> tuple[str, str, int]:
     """Query name and version from the running signer application (ENDPOINT_APP)."""
     fid = 0
-    rx: bytes = proto.send_command(
-        conn, cmdGetNameVersion, proto.ENDPOINT_APP, fid
-    )
+    # CMD_GET_NAME_VERSION_APP ID 0x09, length index 0 (1 byte)
+    rx = _send_command(conn, Cmd.GET_NAME_VERSION_APP, 0, Endpoint.APP, fid)
     name0 = rx[2:6].decode("ascii", errors="ignore").rstrip()
     name1 = rx[6:10].decode("ascii", errors="ignore").rstrip()
     version = int.from_bytes(rx[10:14], byteorder="little")
@@ -73,11 +242,10 @@ def _get_pubkey_from_tkey(conn: Any) -> bytes:
     """Retrieve 1312-byte ML-DSA-44 public key from device in 120-byte chunks."""
     fid = 0
     pubkey = bytearray(1312)
-    for i in range(11):
+    for i in range(KEY_CHUNKS + 1):
         tx_data = bytes([i, 0, 0])  # 1 byte chunk index + 2 bytes padding
-        rx = proto.send_command(
-            conn, cmdGetPubkeyChunk, proto.ENDPOINT_APP, fid, tx_data
-        )
+        # CMD_GET_PUBKEY_CHUNK ID 0x11, length index 1 (4 bytes)
+        rx = _send_command(conn, Cmd.GET_PUBKEY_CHUNK, 1, Endpoint.APP, fid, tx_data)
         fid = (fid + 1) % 4
 
         if rx[2] != 0:
@@ -87,14 +255,14 @@ def _get_pubkey_from_tkey(conn: Any) -> bytes:
                 f"GetPubkeyChunk chunk index mismatch, expected {i}, got {rx[3]}"
             )
 
-        size = 112 if i == 10 else 120
+        size = 112 if i == KEY_CHUNKS else 120
         offset = i * 120
         pubkey[offset : offset + size] = rx[4 : 4 + size]
     return bytes(pubkey)
 
 
 def _sign_on_tkey(conn: Any, formatted_msg: bytes) -> bytes:
-    """Send 68-byte message to TKey, trigger touch-signing, and fetch 2420-byte signature."""
+    """Send payload to TKey and fetch 2420-byte signature."""
     fid = 0
 
     # 1. Set size
@@ -102,16 +270,16 @@ def _sign_on_tkey(conn: Any, formatted_msg: bytes) -> bytes:
     size_bytes = size.to_bytes(4, byteorder="little")
     tx_data = bytearray(31)
     tx_data[0:4] = size_bytes
-    proto.send_command(conn, cmdSetSize, proto.ENDPOINT_APP, fid, bytes(tx_data))
+    # CMD_SET_SIZE ID 0x03, length index 2 (32 bytes)
+    _send_command(conn, Cmd.SET_SIZE, 2, Endpoint.APP, fid, bytes(tx_data))
     fid = (fid + 1) % 4
 
     # 2. Load data
     offset = 0
     while offset < len(formatted_msg):
         chunk = formatted_msg[offset : offset + 127]
-        if len(chunk) < 127:
-            chunk = chunk + b"\x00" * (127 - len(chunk))
-        proto.send_command(conn, cmdSignData, proto.ENDPOINT_APP, fid, chunk)
+        # CMD_SIGN_DATA ID 0x05, length index 3 (128 bytes)
+        _send_command(conn, Cmd.SIGN_DATA, 3, Endpoint.APP, fid, chunk)
         fid = (fid + 1) % 4
         offset += 127
 
@@ -119,23 +287,23 @@ def _sign_on_tkey(conn: Any, formatted_msg: bytes) -> bytes:
     old_timeout = conn.timeout
     conn.timeout = 60
     try:
-        rx = proto.send_command(conn, cmdGetSig, proto.ENDPOINT_APP, fid)
+        # CMD_GET_SIG ID 0x07, length index 0 (1 byte)
+        rx = _send_command(conn, Cmd.GET_SIG, 0, Endpoint.APP, fid)
     finally:
         conn.timeout = old_timeout
     fid = (fid + 1) % 4
 
-    # Validate response format:
-    # header_byte (1) + RSP_GET_SIG ID (1) + status_byte (1) + data (126) = 129
-    if len(rx) < 129 or rx[1] != 0x08 or rx[2] != 0x00:
-        raise error.TKeyProtocolError(
-            f"Response mismatch or NOK status: len={len(rx)} hex={rx.hex()}"
+    if rx[2] != 0x00:
+        raise TKeyProtocolError(
+            f"Response NOK status: hex={rx.hex()}"
         )
 
     # 4. Fetch signature chunks (21 chunks)
     signature = bytearray(2420)
-    for i in range(21):
-        rx = proto.send_command(
-            conn, cmdGetSigChunk, proto.ENDPOINT_APP, fid, bytes([i, 0, 0])
+    for i in range(SIG_CHUNKS + 1):
+        # CMD_GET_SIG_CHUNK ID 0x13, length index 1 (4 bytes)
+        rx = _send_command(
+            conn, Cmd.GET_SIG_CHUNK, 1, Endpoint.APP, fid, bytes([i, 0, 0])
         )
         fid = (fid + 1) % 4
         if rx[2] != 0:
@@ -146,7 +314,7 @@ def _sign_on_tkey(conn: Any, formatted_msg: bytes) -> bytes:
             )
 
         chunk_offset = i * 120
-        chunk_size = 20 if i == 20 else 120
+        chunk_size = 20 if i == SIG_CHUNKS else 120
         signature[chunk_offset : chunk_offset + chunk_size] = rx[4 : 4 + chunk_size]
 
     return bytes(signature)
@@ -280,20 +448,140 @@ class RawSerialConnection:
             self.fd = None
 
 
-def _connect_tkey(device_path: str) -> TKey:
-    """Connect to TKey device at 62500 baud.
+class TKey:
+    """Minimal TKey connection and application loader."""
 
-    Use RawSerial on linux because pyserial seemed to have an issue with the baud rate
-    and multiple connections
-    """
-    if os.uname().sysname == "Linux":
-        tk = TKey(device_path, connect=False)
-        raw_conn = RawSerialConnection(device_path)
-        tk.conn = raw_conn
-    else:
-        tk = TKey(device_path, speed=62500, connect=True)
+    def __init__(
+        self,
+        device: str,
+        speed: int = 62500,
+        timeout: float = 1.0,
+    ) -> None:
+        self.port = device
+        self.baudrate = speed
+        self.timeout = timeout
+        self.conn: Any = None
+        self.connect()
 
-    return tk
+    def connect(self) -> None:
+        if hasattr(os, "uname") and os.uname().sysname == "Linux":
+            self.conn = RawSerialConnection(self.port)
+        else:
+            try:
+                import serial  # type: ignore[import-untyped] # noqa: PLC0415
+            except ImportError as e:
+                raise UnsupportedLibraryError(
+                    "pyserial package is required for TKey connection "
+                    "on non-Linux platforms."
+                ) from e
+
+            try:
+                self.conn = serial.Serial(
+                    self.port, baudrate=self.baudrate, timeout=self.timeout
+                )
+            except Exception as e:
+                raise TKeyConnectionError(
+                    f"Failed to open serial port {self.port}: {e}"
+                ) from e
+
+    def disconnect(self) -> None:
+        if self.conn is not None:
+            try:
+                self.conn.close()
+            except Exception as e:
+                logger.debug("Failed to close TKey connection: %s", e)
+            self.conn = None
+
+    def get_name_version(self) -> tuple[str, str, int]:
+        # cmdNameVersion ID 0x01, length index 0 (1 byte)
+        response = _send_command(self.conn, Cmd.NAME_VERSION, 0, Endpoint.FW, 2)
+        data = response[2:]
+        name0 = data[0:4].decode('ascii', errors='ignore').rstrip()
+        name1 = data[4:8].decode('ascii', errors='ignore').rstrip()
+        version = int.from_bytes(data[8:12], byteorder='little')
+        return name0, name1, version
+
+    def load_app(self, file_path: str, secret: str | None = None) -> None:
+        try:
+            file_size = os.path.getsize(file_path)
+            with open(file_path, 'rb') as f:
+                file_data = f.read()
+        except Exception as e:
+            raise TKeyLoadError(f"Failed to read app file {file_path}: {e}") from e
+
+        if file_size > APP_MAXSIZE:
+            raise TKeyLoadError(f"File too big ({file_size} > {APP_MAXSIZE})")
+
+        file_digest = hashlib.blake2s(file_data, digest_size=32).digest()
+
+        # cmdLoadApp ID 0x03, length index 3 (128 bytes)
+        data = bytearray(127)
+        data[0:4] = file_size.to_bytes(4, byteorder='little')
+        if secret is not None:
+            data[4] = 1
+            encoded_secret = secret.encode('utf-8')
+            data[5 : 5 + len(encoded_secret)] = encoded_secret
+
+        response = _send_command(
+            self.conn, Cmd.LOAD_APP, 3, Endpoint.FW, 2, bytes(data)
+        )
+        load_status = response[2]
+        if load_status == 1:
+            raise TKeyLoadError("Device not ready (STATUS_BAD)")
+
+        result_digest = self._load_app_data(file_data)
+        if file_digest != result_digest:
+            raise TKeyLoadError(
+                "Hash digests do not match "
+                f"({file_digest.hex()} != {result_digest.hex()})"
+            )
+
+    def _load_app_data(self, file_data: bytes) -> bytes:
+        # cmdLoadAppData ID 0x05, length index 3 (128 bytes)
+        digest = b""
+        offset = 0
+        while offset < len(file_data):
+            chunk = file_data[offset : offset + 127]
+            response = _send_command(
+                self.conn, Cmd.LOAD_APP_DATA, 3, Endpoint.FW, 2, chunk
+            )
+            response_id = response[1]
+            status = response[2]
+            if status == 1:
+                raise TKeyLoadError("Bad status when writing app data")
+
+            if response_id == Rsp.LOAD_APP_DATA_READY:
+                digest = response[3:35]
+            elif response_id != Rsp.LOAD_APP_DATA:
+                raise TKeyProtocolError(
+                    f"Unexpected response code {response_id}"
+                )
+
+            offset += 127
+
+        return digest
+
+
+def _list_devices() -> list[Any]:
+    """Discover TKey devices using pyserial."""
+    try:
+        from serial.tools import list_ports  # type: ignore[import-untyped] # noqa: I001, PLC0415
+    except ImportError as e:
+        raise UnsupportedLibraryError(
+            "pyserial package is required for TKey device discovery."
+        ) from e
+
+    devices = []
+    for port in list_ports.comports():
+        if port.vid == USB_VID and port.pid == USB_PID:
+            devices.append(port)
+    return sorted(devices, key=lambda p: p.device)
+
+
+
+
+
+# --- End of Isolated TKey Logic ---
 
 
 # --- End of Isolated TKey Logic ---
@@ -315,9 +603,6 @@ class TKeySigner(Signer):
         public_key: SSlibKey,
         secrets_handler: SecretsHandler | None = None,
     ) -> None:
-        if TKEYCLIENT_IMPORT_ERROR:
-            raise UnsupportedLibraryError(TKEYCLIENT_IMPORT_ERROR)
-
         if public_key.scheme != "ml-dsa-44/1":
             raise ValueError(f"unsupported scheme {public_key.scheme}")
 
@@ -336,9 +621,6 @@ class TKeySigner(Signer):
         public_key: Key,
         secrets_handler: SecretsHandler | None = None,
     ) -> TKeySigner:
-        if TKEYCLIENT_IMPORT_ERROR:
-            raise UnsupportedLibraryError(TKEYCLIENT_IMPORT_ERROR)
-
         if not isinstance(public_key, SSlibKey):
             raise ValueError(f"expected SSlibKey for {priv_key_uri}")
 
@@ -357,16 +639,13 @@ class TKeySigner(Signer):
         device_path: str | None = None,
     ) -> tuple[str, SSlibKey]:
         """Import public key and signer details from TKey device."""
-        if TKEYCLIENT_IMPORT_ERROR:
-            raise UnsupportedLibraryError(TKEYCLIENT_IMPORT_ERROR)
-
         if device_path is None:
-            devices = hw.list_devices()
+            devices = _list_devices()
             if not devices:
                 raise ValueError("No TKey device found")
             device_path = devices[0].device
 
-        tk = _connect_tkey(device_path)
+        tk = TKey(device_path)
         try:
             cls._ensure_app_loaded(tk)
             raw_pubkey = _get_pubkey_from_tkey(tk.conn)
@@ -388,7 +667,7 @@ class TKeySigner(Signer):
             fw = tk.get_name_version()
             if fw[0] != "tk1" or fw[1] != "mkdf":
                 raise RuntimeError(f"TKey is running an unknown firmware {fw}")
-        except (error.TKeyStatusError, error.TKeyReadError, error.TKeyProtocolError):
+        except (TKeyStatusError, TKeyReadError, TKeyProtocolError):
             # The running application rejected the firmware command, or timed out
             # Query application name and version
             try:
@@ -414,7 +693,7 @@ class TKeySigner(Signer):
         # Find device
         dev = self.device_path
         if dev is None:
-            devices = hw.list_devices()
+            devices = _list_devices()
             if not devices:
                 raise RuntimeError("No TKey device found")
             dev = devices[0].device
@@ -423,7 +702,7 @@ class TKeySigner(Signer):
         digest = hashlib.sha512(payload).digest()
         formatted_msg = b"tuf" + bytes([1]) + digest
 
-        tk = _connect_tkey(dev)
+        tk = TKey(dev)
         try:
             self._ensure_app_loaded(tk)
             sig_bytes = _sign_on_tkey(tk.conn, formatted_msg)
@@ -431,3 +710,4 @@ class TKeySigner(Signer):
             tk.disconnect()
 
         return Signature(self.public_key.keyid, sig_bytes.hex())
+
