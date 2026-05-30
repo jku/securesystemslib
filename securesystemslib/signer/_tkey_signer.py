@@ -5,9 +5,20 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import select
 from importlib.resources import as_file, files
-from typing import Any
+from typing import Any, TYPE_CHECKING
 from urllib import parse
+
+try:
+    # only used on linux
+    import array
+    import fcntl
+    import termios
+except ImportError:
+    array = None  # type: ignore[assignment]
+    fcntl = None  # type: ignore[assignment]
+    termios = None  # type: ignore[assignment]
 
 from cryptography.hazmat.primitives.asymmetric.mldsa import MLDSA44PublicKey
 
@@ -15,6 +26,10 @@ from securesystemslib.exceptions import UnsupportedLibraryError
 from securesystemslib.signer._key import Key, SSlibKey
 from securesystemslib.signer._signature import Signature
 from securesystemslib.signer._signer import SecretsHandler, Signer
+
+if TYPE_CHECKING:
+    import serial
+
 
 logger = logging.getLogger(__name__)
 
@@ -42,17 +57,17 @@ if not TKEYCLIENT_IMPORT_ERROR:
     rspGetNameVersion = proto.fwCommand(0x0A, 2)  # LEN_32
 
 
-def _get_app_name_version(conn: Any) -> tuple[str, str, int]:
+def _get_app_name_version(conn: serial.Serial) -> tuple[str, str, int]:
     """Query name and version from the running signer application (ENDPOINT_APP)."""
     id = 2
-    rx = proto.send_command(conn, cmdGetNameVersion, proto.ENDPOINT_APP, id)
+    rx:bytes = proto.send_command(conn, cmdGetNameVersion, proto.ENDPOINT_APP, id)
     name0 = rx[2:6].decode("ascii", errors="ignore").rstrip()
     name1 = rx[6:10].decode("ascii", errors="ignore").rstrip()
     version = int.from_bytes(rx[10:14], byteorder="little")
     return name0, name1, version
 
 
-def _get_pubkey_from_tkey(conn: Any) -> bytes:
+def _get_pubkey_from_tkey(conn: serial.Serial) -> bytes:
     """Retrieve 1312-byte ML-DSA-44 public key from device in 120-byte chunks."""
     id = 2
     pubkey = bytearray(1312)
@@ -75,7 +90,7 @@ def _get_pubkey_from_tkey(conn: Any) -> bytes:
     return bytes(pubkey)
 
 
-def _sign_on_tkey(conn: Any, formatted_msg: bytes) -> bytes:
+def _sign_on_tkey(conn: serial.Serial, formatted_msg: bytes) -> bytes:
     """Send 68-byte message to TKey, trigger touch-signing, and fetch 2420-byte signature."""
     id = 2
 
@@ -145,93 +160,29 @@ def _sign_on_tkey(conn: Any, formatted_msg: bytes) -> bytes:
 
 
 class RawSerialConnection:
-    """A raw Python serial connection using standard os.open/ioctl configured in raw mode at 62500 baud."""
+    """A raw Python serial connection.
+
+    Uses standard os.open/ioctl configured in raw mode at 62500 baud.
+    """
 
     def __init__(self, port: str) -> None:
-        import array
-        import fcntl
-        import termios
-
         self.port = port
         self.baudrate = 62500
         self.timeout = 30.0  # Constant timeout covering long touch signatures
-        self.is_open = True
-
-        # Open raw file descriptor
-        self.fd: int | None = os.open(port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
-
-        # 1. Fetch current termios2 settings
-        TCGETS2 = 0x802C542A
-        TCSETS2 = 0x402C542B
-        BOTHER = 0o010000
-
-        buf = array.array("i", [0] * 64)
-        fcntl.ioctl(self.fd, TCGETS2, buf)
-
-        # 2. Configure Raw Mode
-        # Clear iflag
-        buf[0] &= ~(
-            termios.IGNBRK
-            | termios.BRKINT
-            | termios.PARMRK
-            | termios.ISTRIP
-            | termios.INLCR
-            | termios.IGNCR
-            | termios.ICRNL
-            | termios.IXON
-            | termios.IXOFF
-            | termios.IXANY
-            | termios.INPCK
-        )
-
-        # Clear oflag
-        buf[1] &= ~termios.OPOST
-
-        # Clear lflag
-        buf[3] &= ~(
-            termios.ECHO
-            | termios.ECHONL
-            | termios.ICANON
-            | termios.ISIG
-            | termios.IEXTEN
-        )
-
-        # Set control mode flags (cflag): CS8, CREAD, CLOCAL, BOTHER, and disable Flow Control
-        buf[2] &= ~0x100F  # Clear CBAUD/CBAUDEX
-        buf[2] |= BOTHER  # Set BOTHER
-        buf[2] |= termios.CS8 | termios.CREAD | termios.CLOCAL
-        CRTSCTS = 0o20000000000  # Linux CRTSCTS flag value
-        buf[2] &= ~CRTSCTS
-
-        # Set custom speed 62500
-        buf[9] = buf[10] = 62500
-        fcntl.ioctl(self.fd, TCSETS2, buf)
-
-        # Restore blocking mode for writes and select-driven reads
-        flags = fcntl.fcntl(self.fd, fcntl.F_GETFL)
-        fcntl.fcntl(self.fd, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
-
-        # Acquire exclusive access
-        TIOCEXCL = 0x540C
-        fcntl.ioctl(self.fd, TIOCEXCL, 0)
+        self.fd: int | None = None
+        self.open()
 
     def open(self) -> None:
-        import array
-        import fcntl
-        import termios
+        if self.fd is not None:
+            return
 
-        if self.fd is None:
-            self.fd = os.open(self.port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        self.fd = os.open(self.port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        try:
+            # 1. Use standard termios to configure raw 8N1 mode
+            attrs = termios.tcgetattr(self.fd)
 
-            TCGETS2 = 0x802C542A
-            TCSETS2 = 0x402C542B
-            BOTHER = 0o010000
-
-            buf = array.array("i", [0] * 64)
-            fcntl.ioctl(self.fd, TCGETS2, buf)
-
-            # Configure Raw Mode
-            buf[0] &= ~(
+            # Clear input processing
+            attrs[0] &= ~(
                 termios.IGNBRK
                 | termios.BRKINT
                 | termios.PARMRK
@@ -244,32 +195,57 @@ class RawSerialConnection:
                 | termios.IXANY
                 | termios.INPCK
             )
-            buf[1] &= ~termios.OPOST
-            buf[3] &= ~(
+            # Clear output processing (raw output)
+            attrs[1] &= ~termios.OPOST
+            # Clear local modes (no echo, no signals, no canonical input)
+            attrs[3] &= ~(
                 termios.ECHO
                 | termios.ECHONL
                 | termios.ICANON
                 | termios.ISIG
                 | termios.IEXTEN
             )
+            # Clear control modes (no size, parity, stop bits, flow control)
+            attrs[2] &= ~(
+                termios.CSIZE
+                | termios.PARENB
+                | termios.CSTOPB
+                | termios.CRTSCTS
+            )
+            attrs[2] |= termios.CS8 | termios.CREAD | termios.CLOCAL
 
-            buf[2] &= ~0x100F
-            buf[2] |= BOTHER
-            buf[2] |= termios.CS8 | termios.CREAD | termios.CLOCAL
-            CRTSCTS = 0o20000000000
-            buf[2] &= ~CRTSCTS
+            # Set speed elements to standard constant to avoid EINVAL on custom speeds
+            attrs[4] = termios.B9600
+            attrs[5] = termios.B9600
 
-            buf[9] = buf[10] = 62500
-            fcntl.ioctl(self.fd, TCSETS2, buf)
+            # Apply standard configuration
+            termios.tcsetattr(self.fd, termios.TCSANOW, attrs)
 
+            # 2. Use termios2 ioctls ONLY to set the custom 62500 baud rate
+            tcgets2 = 0x802C542A
+            tcsets2 = 0x402C542B
+            bother = 0o010000
+
+            buf = array.array("i", [0] * 64)
+            fcntl.ioctl(self.fd, tcgets2, buf)
+
+            buf[2] &= ~0x100F  # Clear CBAUD/CBAUDEX speed flags
+            buf[2] |= bother   # Flag for custom speed (BOTHER)
+            buf[9] = buf[10] = 62500  # Set custom speed
+
+            fcntl.ioctl(self.fd, tcsets2, buf)
+
+            # 3. Restore blocking mode
             flags = fcntl.fcntl(self.fd, fcntl.F_GETFL)
             fcntl.fcntl(self.fd, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
 
-            # Acquire exclusive access
-            TIOCEXCL = 0x540C
-            fcntl.ioctl(self.fd, TIOCEXCL, 0)
-
-            self.is_open = True
+            # 4. Acquire exclusive access
+            tiocexcl = 0x540C
+            fcntl.ioctl(self.fd, tiocexcl, 0)
+        except Exception:
+            os.close(self.fd)
+            self.fd = None
+            raise
 
     def write(self, data: bytes) -> int:
         if self.fd is None:
@@ -278,8 +254,6 @@ class RawSerialConnection:
 
     def read(self, n: int) -> bytes:
         """Read exactly n bytes blockingly, respecting the configured timeout."""
-        import select
-
         if self.fd is None:
             raise ValueError("Port is closed")
         data = bytearray()
@@ -293,18 +267,11 @@ class RawSerialConnection:
             data.extend(chunk)
         return bytes(data)
 
-    def reset_input_buffer(self) -> None:
-        pass
-
-    def reset_output_buffer(self) -> None:
-        pass
+    def reset_input_buffer(self) -> None: pass
+    def reset_output_buffer(self) -> None: pass
 
     @property
     def in_waiting(self) -> int:
-        import array
-        import fcntl
-        import termios
-
         if self.fd is None:
             return 0
         buf = array.array("i", [0])
@@ -318,7 +285,6 @@ class RawSerialConnection:
         if self.fd is not None:
             os.close(self.fd)
             self.fd = None
-            self.is_open = False
 
 
 def _connect_tkey(device_path: str) -> TKey:
@@ -426,21 +392,20 @@ class TKeySigner(Signer):
         """Check if signer app is loaded on TKey, and load it in firmware mode."""
         # 1. Try to query firmware mode name and version
         try:
-            name0, name1, _ = tk.get_name_version()
-            is_firmware = name0 == "tk1" and name1 == "mkdf"
+            fw = tk.get_name_version()
+            if fw[0] != "tk1" or fw[1] != "mkdf":
+                raise RuntimeError(f"TKey is running an unknown firmware {fw}")
         except (error.TKeyStatusError, error.TKeyReadError, error.TKeyProtocolError):
             # The running application rejected the firmware command, or timed out
-            is_firmware = False
-        if not is_firmware:
-            # 2. Query application mode name and version
+            # Query application name and version
             try:
                 name0, name1, _ = _get_app_name_version(tk.conn)
-                if name0 == "tk1" and name1 == "mlds":
-                    # Signer application already loaded
-                    return
-                raise RuntimeError("TKey is running an unknown application")
             except Exception as e:
                 raise RuntimeError("TKey is unresponsive") from e
+            if name0 == "tk1" and name1 == "mlds":
+                # Signer application already loaded
+                return
+            raise RuntimeError("TKey is running an unknown application")
 
         # If we reached here, we are in firmware mode. Load the app
         app_resource = files("securesystemslib.signer").joinpath("app.bin")
