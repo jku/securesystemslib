@@ -6,6 +6,7 @@ import hashlib
 import logging
 import os
 from importlib.resources import as_file, files
+from typing import Any
 from urllib import parse
 
 from cryptography.hazmat.primitives.asymmetric.mldsa import MLDSA44PublicKey
@@ -41,7 +42,7 @@ if not TKEYCLIENT_IMPORT_ERROR:
     rspGetNameVersion = proto.fwCommand(0x0A, 2)  # LEN_32
 
 
-def _get_app_name_version(conn) -> tuple[str, str, int]:
+def _get_app_name_version(conn: Any) -> tuple[str, str, int]:
     """Query name and version from the running signer application (ENDPOINT_APP)."""
     id = 2
     rx = proto.send_command(conn, cmdGetNameVersion, proto.ENDPOINT_APP, id)
@@ -51,7 +52,7 @@ def _get_app_name_version(conn) -> tuple[str, str, int]:
     return name0, name1, version
 
 
-def _get_pubkey_from_tkey(conn) -> bytes:
+def _get_pubkey_from_tkey(conn: Any) -> bytes:
     """Retrieve 1312-byte ML-DSA-44 public key from device in 120-byte chunks."""
     id = 2
     pubkey = bytearray(1312)
@@ -74,7 +75,7 @@ def _get_pubkey_from_tkey(conn) -> bytes:
     return bytes(pubkey)
 
 
-def _sign_on_tkey(conn, formatted_msg: bytes) -> bytes:
+def _sign_on_tkey(conn: Any, formatted_msg: bytes) -> bytes:
     """Send 68-byte message to TKey, trigger touch-signing, and fetch 2420-byte signature."""
     id = 2
 
@@ -146,7 +147,7 @@ def _sign_on_tkey(conn, formatted_msg: bytes) -> bytes:
 class RawSerialConnection:
     """A raw Python serial connection using standard os.open/ioctl configured in raw mode at 62500 baud."""
 
-    def __init__(self, port: str):
+    def __init__(self, port: str) -> None:
         import array
         import fcntl
         import termios
@@ -157,7 +158,7 @@ class RawSerialConnection:
         self.is_open = True
 
         # Open raw file descriptor
-        self.fd = os.open(port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        self.fd: int | None = os.open(port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
 
         # 1. Fetch current termios2 settings
         TCGETS2 = 0x802C542A
@@ -214,7 +215,7 @@ class RawSerialConnection:
         TIOCEXCL = 0x540C
         fcntl.ioctl(self.fd, TIOCEXCL, 0)
 
-    def open(self):
+    def open(self) -> None:
         import array
         import fcntl
         import termios
@@ -292,10 +293,10 @@ class RawSerialConnection:
             data.extend(chunk)
         return bytes(data)
 
-    def reset_input_buffer(self):
+    def reset_input_buffer(self) -> None:
         pass
 
-    def reset_output_buffer(self):
+    def reset_output_buffer(self) -> None:
         pass
 
     @property
@@ -313,7 +314,7 @@ class RawSerialConnection:
         except Exception:
             return 0
 
-    def close(self):
+    def close(self) -> None:
         if self.fd is not None:
             os.close(self.fd)
             self.fd = None
@@ -354,7 +355,7 @@ class TKeySigner(Signer):
         device_path: str | None,
         public_key: SSlibKey,
         secrets_handler: SecretsHandler | None = None,
-    ):
+    ) -> None:
         if TKEYCLIENT_IMPORT_ERROR:
             raise UnsupportedLibraryError(TKEYCLIENT_IMPORT_ERROR)
 
