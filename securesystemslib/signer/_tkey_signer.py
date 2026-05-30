@@ -1,0 +1,474 @@
+"""Signer for Tillitis TKey"""
+
+from __future__ import annotations
+
+import hashlib
+import logging
+import os
+from importlib.resources import as_file, files
+from urllib import parse
+
+from cryptography.hazmat.primitives.asymmetric.mldsa import MLDSA44PublicKey
+
+from securesystemslib.exceptions import UnsupportedLibraryError
+from securesystemslib.signer._key import Key, SSlibKey
+from securesystemslib.signer._signature import Signature
+from securesystemslib.signer._signer import SecretsHandler, Signer
+
+logger = logging.getLogger(__name__)
+
+TKEYCLIENT_IMPORT_ERROR = None
+try:
+    from tkeyclient import error, hw, proto  # type: ignore[import-untyped]
+    from tkeyclient.tkey import TKey  # type: ignore[import-untyped]
+except ImportError:
+    TKEYCLIENT_IMPORT_ERROR = "Signing with TKey requires the 'tkeyclient' package."
+
+# --- Isolated TKey Custom Commands & Protocol Logic ---
+
+if not TKEYCLIENT_IMPORT_ERROR:
+    cmdGetPubkeyChunk = proto.fwCommand(0x11, 1)  # LEN_4
+    rspGetPubkeyChunk = proto.fwCommand(0x12, 3)  # LEN_128
+    cmdSetSize = proto.fwCommand(0x03, 2)  # LEN_32
+    rspSetSize = proto.fwCommand(0x04, 1)  # LEN_4
+    cmdSignData = proto.fwCommand(0x05, 3)  # LEN_128
+    rspSignData = proto.fwCommand(0x06, 1)  # LEN_4
+    cmdGetSig = proto.fwCommand(0x07, 0)  # LEN_1
+    rspGetSig = proto.fwCommand(0x08, 3)  # LEN_128
+    cmdGetSigChunk = proto.fwCommand(0x13, 1)  # LEN_4
+    rspGetSigChunk = proto.fwCommand(0x14, 3)  # LEN_128
+    cmdGetNameVersion = proto.fwCommand(0x09, 0)  # LEN_1
+    rspGetNameVersion = proto.fwCommand(0x0A, 2)  # LEN_32
+
+
+def _get_app_name_version(conn) -> tuple[str, str, int]:
+    """Query name and version from the running signer application (ENDPOINT_APP)."""
+    id = 2
+    rx = proto.send_command(conn, cmdGetNameVersion, proto.ENDPOINT_APP, id)
+    name0 = rx[2:6].decode("ascii", errors="ignore").rstrip()
+    name1 = rx[6:10].decode("ascii", errors="ignore").rstrip()
+    version = int.from_bytes(rx[10:14], byteorder="little")
+    return name0, name1, version
+
+
+def _get_pubkey_from_tkey(conn) -> bytes:
+    """Retrieve 1312-byte ML-DSA-44 public key from device in 120-byte chunks."""
+    id = 2
+    pubkey = bytearray(1312)
+    for i in range(11):
+        tx_data = bytes([i, 0, 0])  # 1 byte chunk index + 2 bytes padding
+        rx = proto.send_command(
+            conn, cmdGetPubkeyChunk, proto.ENDPOINT_APP, id, tx_data
+        )
+
+        if rx[2] != 0:
+            raise ValueError(f"GetPubkeyChunk NOK status: {rx[2]}")
+        if rx[3] != i:
+            raise ValueError(
+                f"GetPubkeyChunk chunk index mismatch, expected {i}, got {rx[3]}"
+            )
+
+        size = 112 if i == 10 else 120
+        offset = i * 120
+        pubkey[offset : offset + size] = rx[4 : 4 + size]
+    return bytes(pubkey)
+
+
+def _sign_on_tkey(conn, formatted_msg: bytes) -> bytes:
+    """Send 68-byte message to TKey, trigger touch-signing, and fetch 2420-byte signature."""
+    id = 2
+
+    # 1. Set size
+    size = len(formatted_msg)
+    size_bytes = size.to_bytes(4, byteorder="little")
+    tx_data = bytearray(31)
+    tx_data[0:4] = size_bytes
+    proto.send_command(conn, cmdSetSize, proto.ENDPOINT_APP, id, bytes(tx_data))
+
+    # 2. Load data
+    offset = 0
+    while offset < len(formatted_msg):
+        chunk = formatted_msg[offset : offset + 127]
+        if len(chunk) < 127:
+            chunk = chunk + b"\x00" * (127 - len(chunk))
+        proto.send_command(conn, cmdSignData, proto.ENDPOINT_APP, id, chunk)
+        offset += 127
+
+    # 3. Trigger signing (blocks waiting for physical touch)
+    # NOTE: We manually construct the GetSig frame and handle the blocking read instead of
+    # calling proto.send_command(conn, cmdGetSig, proto.ENDPOINT_APP, id).
+    # This is to avoid a bug in tkeyclient-py where keeping conn.timeout = 60 during the
+    # entire read_frame() call causes severe serial read slowness on POSIX platforms.
+    # By reading the first byte blockingly (which waits for touch) and then immediately
+    # restoring the default timeout before reading the bulk of the response payload,
+    # we get instantaneous signature retrieval.
+    trigger_sign_frame = bytearray([0x58, 0x07])
+    conn.write(trigger_sign_frame)
+
+    old_timeout = conn.timeout
+    conn.timeout = 60
+    try:
+        header_byte = conn.read(1)
+        if len(header_byte) == 0:
+            raise error.TKeyReadError("No response data")
+
+        # Read the remaining 128 bytes of RSP_GET_SIG response frame (RSP code + payload)
+        # We must read ALL bytes before restoring the timeout to prevent USB control race conditions!
+        remaining_rx = conn.read(128)
+    finally:
+        conn.timeout = old_timeout
+
+    if len(remaining_rx) < 128 or remaining_rx[0] != 0x08 or remaining_rx[1] != 0x00:
+        raise error.TKeyProtocolError(
+            f"Response mismatch: len={len(remaining_rx)} hex={remaining_rx.hex()}"
+        )
+
+    # 4. Fetch signature chunks (21 chunks)
+    signature = bytearray(2420)
+    for i in range(21):
+        rx = proto.send_command(
+            conn, cmdGetSigChunk, proto.ENDPOINT_APP, id, bytes([i, 0, 0])
+        )
+        if rx[2] != 0:
+            raise ValueError(f"GetSigChunk NOK status: {rx[2]}")
+        if rx[3] != i:
+            raise ValueError(
+                f"GetSigChunk chunk index mismatch, expected {i}, got {rx[3]}"
+            )
+
+        chunk_offset = i * 120
+        chunk_size = 20 if i == 20 else 120
+        signature[chunk_offset : chunk_offset + chunk_size] = rx[4 : 4 + chunk_size]
+
+    return bytes(signature)
+
+
+class RawSerialConnection:
+    """A raw Python serial connection using standard os.open/ioctl configured in raw mode at 62500 baud."""
+
+    def __init__(self, port: str):
+        import array
+        import fcntl
+        import termios
+
+        self.port = port
+        self.baudrate = 62500
+        self.timeout = 30.0  # Constant timeout covering long touch signatures
+        self.is_open = True
+
+        # Open raw file descriptor
+        self.fd = os.open(port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+
+        # 1. Fetch current termios2 settings
+        TCGETS2 = 0x802C542A
+        TCSETS2 = 0x402C542B
+        BOTHER = 0o010000
+
+        buf = array.array("i", [0] * 64)
+        fcntl.ioctl(self.fd, TCGETS2, buf)
+
+        # 2. Configure Raw Mode
+        # Clear iflag
+        buf[0] &= ~(
+            termios.IGNBRK
+            | termios.BRKINT
+            | termios.PARMRK
+            | termios.ISTRIP
+            | termios.INLCR
+            | termios.IGNCR
+            | termios.ICRNL
+            | termios.IXON
+            | termios.IXOFF
+            | termios.IXANY
+            | termios.INPCK
+        )
+
+        # Clear oflag
+        buf[1] &= ~termios.OPOST
+
+        # Clear lflag
+        buf[3] &= ~(
+            termios.ECHO
+            | termios.ECHONL
+            | termios.ICANON
+            | termios.ISIG
+            | termios.IEXTEN
+        )
+
+        # Set control mode flags (cflag): CS8, CREAD, CLOCAL, BOTHER, and disable Flow Control
+        buf[2] &= ~0x100F  # Clear CBAUD/CBAUDEX
+        buf[2] |= BOTHER  # Set BOTHER
+        buf[2] |= termios.CS8 | termios.CREAD | termios.CLOCAL
+        CRTSCTS = 0o20000000000  # Linux CRTSCTS flag value
+        buf[2] &= ~CRTSCTS
+
+        # Set custom speed 62500
+        buf[9] = buf[10] = 62500
+        fcntl.ioctl(self.fd, TCSETS2, buf)
+
+        # Restore blocking mode for writes and select-driven reads
+        flags = fcntl.fcntl(self.fd, fcntl.F_GETFL)
+        fcntl.fcntl(self.fd, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
+
+        # Acquire exclusive access
+        TIOCEXCL = 0x540C
+        fcntl.ioctl(self.fd, TIOCEXCL, 0)
+
+    def open(self):
+        import array
+        import fcntl
+        import termios
+
+        if self.fd is None:
+            self.fd = os.open(self.port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+
+            TCGETS2 = 0x802C542A
+            TCSETS2 = 0x402C542B
+            BOTHER = 0o010000
+
+            buf = array.array("i", [0] * 64)
+            fcntl.ioctl(self.fd, TCGETS2, buf)
+
+            # Configure Raw Mode
+            buf[0] &= ~(
+                termios.IGNBRK
+                | termios.BRKINT
+                | termios.PARMRK
+                | termios.ISTRIP
+                | termios.INLCR
+                | termios.IGNCR
+                | termios.ICRNL
+                | termios.IXON
+                | termios.IXOFF
+                | termios.IXANY
+                | termios.INPCK
+            )
+            buf[1] &= ~termios.OPOST
+            buf[3] &= ~(
+                termios.ECHO
+                | termios.ECHONL
+                | termios.ICANON
+                | termios.ISIG
+                | termios.IEXTEN
+            )
+
+            buf[2] &= ~0x100F
+            buf[2] |= BOTHER
+            buf[2] |= termios.CS8 | termios.CREAD | termios.CLOCAL
+            CRTSCTS = 0o20000000000
+            buf[2] &= ~CRTSCTS
+
+            buf[9] = buf[10] = 62500
+            fcntl.ioctl(self.fd, TCSETS2, buf)
+
+            flags = fcntl.fcntl(self.fd, fcntl.F_GETFL)
+            fcntl.fcntl(self.fd, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
+
+            # Acquire exclusive access
+            TIOCEXCL = 0x540C
+            fcntl.ioctl(self.fd, TIOCEXCL, 0)
+
+            self.is_open = True
+
+    def write(self, data: bytes) -> int:
+        if self.fd is None:
+            raise ValueError("Port is closed")
+        return os.write(self.fd, data)
+
+    def read(self, n: int) -> bytes:
+        """Read exactly n bytes blockingly, respecting the configured timeout."""
+        import select
+
+        if self.fd is None:
+            raise ValueError("Port is closed")
+        data = bytearray()
+        while len(data) < n:
+            r, _, _ = select.select([self.fd], [], [], self.timeout)
+            if not r:
+                break  # Timeout
+            chunk = os.read(self.fd, n - len(data))
+            if len(chunk) == 0:
+                break  # EOF/Disconnect
+            data.extend(chunk)
+        return bytes(data)
+
+    def reset_input_buffer(self):
+        pass
+
+    def reset_output_buffer(self):
+        pass
+
+    @property
+    def in_waiting(self) -> int:
+        import array
+        import fcntl
+        import termios
+
+        if self.fd is None:
+            return 0
+        buf = array.array("i", [0])
+        try:
+            fcntl.ioctl(self.fd, termios.FIONREAD, buf)
+            return buf[0]
+        except Exception:
+            return 0
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+            self.is_open = False
+
+
+def _connect_tkey(device_path: str) -> TKey:
+    """Connect to TKey device at 62500 baud.
+
+    Use RawSerial on linux because pyserial seemed to have an issue with the baud rate
+    and multiple connections
+    """
+    if os.uname().sysname == "Linux":
+        tk = TKey(device_path, connect=False)
+        raw_conn = RawSerialConnection(device_path)
+        tk.conn = raw_conn
+    else:
+        tk = TKey(device_path, speed=62500, connect=True)
+
+    return tk
+
+
+# --- End of Isolated TKey Logic ---
+
+
+class TKeySigner(Signer):
+    """Tillitis TKey Signer.
+
+    Supports signing scheme "ml-dsa-44/1".
+    """
+
+    # TODO support "uss" as secret: see tk.load_app()
+
+    SCHEME = "tkey"
+
+    def __init__(
+        self,
+        device_path: str | None,
+        public_key: SSlibKey,
+        secrets_handler: SecretsHandler | None = None,
+    ):
+        if TKEYCLIENT_IMPORT_ERROR:
+            raise UnsupportedLibraryError(TKEYCLIENT_IMPORT_ERROR)
+
+        if public_key.scheme != "ml-dsa-44/1":
+            raise ValueError(f"unsupported scheme {public_key.scheme}")
+
+        self.device_path = device_path
+        self._public_key = public_key
+        self.secrets_handler = secrets_handler
+
+    @property
+    def public_key(self) -> SSlibKey:
+        return self._public_key
+
+    @classmethod
+    def from_priv_key_uri(
+        cls,
+        priv_key_uri: str,
+        public_key: Key,
+        secrets_handler: SecretsHandler | None = None,
+    ) -> TKeySigner:
+        if TKEYCLIENT_IMPORT_ERROR:
+            raise UnsupportedLibraryError(TKEYCLIENT_IMPORT_ERROR)
+
+        if not isinstance(public_key, SSlibKey):
+            raise ValueError(f"expected SSlibKey for {priv_key_uri}")
+
+        uri = parse.urlparse(priv_key_uri)
+        if uri.scheme != cls.SCHEME:
+            raise ValueError(f"TKeySigner does not support {priv_key_uri}")
+
+        # Extract device path (empty or "/" triggers auto-detect)
+        device_path = uri.path if uri.path not in ("", "/") else None
+
+        return cls(device_path, public_key, secrets_handler)
+
+    @classmethod
+    def import_(
+        cls,
+        device_path: str | None = None,
+    ) -> tuple[str, SSlibKey]:
+        """Import public key and signer details from TKey device."""
+        if TKEYCLIENT_IMPORT_ERROR:
+            raise UnsupportedLibraryError(TKEYCLIENT_IMPORT_ERROR)
+
+        if device_path is None:
+            devices = hw.list_devices()
+            if not devices:
+                raise ValueError("No TKey device found")
+            device_path = devices[0].device
+
+        tk = _connect_tkey(device_path)
+        try:
+            cls._ensure_app_loaded(tk)
+            raw_pubkey = _get_pubkey_from_tkey(tk.conn)
+        finally:
+            tk.disconnect()
+
+        key = SSlibKey.from_crypto(MLDSA44PublicKey.from_public_bytes(raw_pubkey))
+
+        # Build URI
+        uri = f"{cls.SCHEME}:{device_path}"
+
+        return uri, key
+
+    @classmethod
+    def _ensure_app_loaded(cls, tk: TKey) -> None:
+        """Check if signer app is loaded on TKey, and load it in firmware mode."""
+        # 1. Try to query firmware mode name and version
+        try:
+            name0, name1, _ = tk.get_name_version()
+            is_firmware = name0 == "tk1" and name1 == "mkdf"
+        except (error.TKeyStatusError, error.TKeyReadError, error.TKeyProtocolError):
+            # The running application rejected the firmware command, or timed out
+            is_firmware = False
+        if not is_firmware:
+            # 2. Query application mode name and version
+            try:
+                name0, name1, _ = _get_app_name_version(tk.conn)
+                if name0 == "tk1" and name1 == "mlds":
+                    # Signer application already loaded
+                    return
+                raise RuntimeError("TKey is running an unknown application")
+            except Exception as e:
+                raise RuntimeError("TKey is unresponsive") from e
+
+        # If we reached here, we are in firmware mode. Load the app
+        app_resource = files("securesystemslib.signer").joinpath("app.bin")
+        with as_file(app_resource) as app_path:
+            tk.load_app(str(app_path))
+
+        if tk.conn.in_waiting:
+            tk.conn.read(tk.conn.in_waiting)
+
+    def sign(self, payload: bytes) -> Signature:
+        """Signs payload with Tillitis TKey."""
+        # 1. Connect to TKey and make sure the app is loaded
+        # Find device
+        dev = self.device_path
+        if dev is None:
+            devices = hw.list_devices()
+            if not devices:
+                raise RuntimeError("No TKey device found")
+            dev = devices[0].device
+
+        # Use TUF-specific message prefix
+        digest = hashlib.sha512(payload).digest()
+        formatted_msg = b"tuf" + bytes([1]) + digest
+
+        tk = _connect_tkey(dev)
+        try:
+            self._ensure_app_loaded(tk)
+            sig_bytes = _sign_on_tkey(tk.conn, formatted_msg)
+        finally:
+            tk.disconnect()
+
+        return Signature(self.public_key.keyid, sig_bytes.hex())
