@@ -251,7 +251,12 @@ class _RawSerialConnection:
 class _TKey:
     """Client for a TKey ML-DSA signer application"""
 
-    def __init__(self, device: str, version: int) -> None:
+    def __init__(
+        self,
+        device: str,
+        version: int,
+        secret: str | None = None,
+    ) -> None:
         if PYSERIAL_IMPORT_ERROR:
             raise UnsupportedLibraryError(PYSERIAL_IMPORT_ERROR)
 
@@ -259,6 +264,7 @@ class _TKey:
         self._conn: _SerialConnection | None = None
         self._fid = 0
         self.version = version
+        self.secret = secret
         self.app_resource = files("securesystemslib.signer.tkey").joinpath(
             f"app_v{version}.bin"
         )
@@ -520,7 +526,7 @@ class _TKey:
 
         # If we reached here, we are in firmware mode. Load the app
         with as_file(self.app_resource) as app_path:
-            self._load_app(str(app_path))
+            self._load_app(str(app_path), secret=self.secret)
 
         if self._conn and self._conn.in_waiting:
             self._conn.read(self._conn.in_waiting)
@@ -595,8 +601,6 @@ class TKeySigner(Signer):
     Supports signing scheme "ml-dsa-44/1".
     """
 
-    # TODO support "uss" as secret: see tk.load_app()
-
     SCHEME = "tkey"
 
     def __init__(
@@ -605,6 +609,7 @@ class TKeySigner(Signer):
         version: int,
         public_key: SSlibKey,
         secrets_handler: SecretsHandler | None = None,
+        use_uss: bool = False,
     ) -> None:
         if public_key.scheme != "ml-dsa-44/1":
             raise ValueError(f"unsupported scheme {public_key.scheme}")
@@ -613,6 +618,7 @@ class TKeySigner(Signer):
         self._public_key = public_key
         self.secrets_handler = secrets_handler
         self.version = version
+        self.use_uss = use_uss
 
     @property
     def public_key(self) -> SSlibKey:
@@ -635,8 +641,9 @@ class TKeySigner(Signer):
         # Extract device path (empty or "/" triggers auto-detect)
         device_path = uri.path if uri.path not in ("", "/") else None
 
-        # Extract version from query parameter, default to 4
+        # Extract query parameters
         query_params = parse.parse_qs(uri.query)
+
         version = 4
         if "version" in query_params:
             try:
@@ -644,13 +651,23 @@ class TKeySigner(Signer):
             except (ValueError, IndexError):
                 raise ValueError(f"Invalid version in URI: {priv_key_uri}")
 
-        return cls(device_path, version, public_key, secrets_handler)
+        use_uss_str = query_params.get("use_uss", ["false"])[0]
+        use_uss = use_uss_str.lower() == "true"
+
+        return cls(
+            device_path,
+            version,
+            public_key,
+            secrets_handler,
+            use_uss,
+        )
 
     @classmethod
     def import_(
         cls,
         device_path: str | None = None,
         version: int = 4,
+        uss: str | None = None,
     ) -> tuple[str, SSlibKey]:
         """Import public key and signer details from TKey device."""
         if device_path is None:
@@ -659,13 +676,17 @@ class TKeySigner(Signer):
                 raise ValueError("No TKey device found")
             device_path = devices[0]
 
-        with _TKey(device_path, version) as tk:
+        with _TKey(device_path, version, secret=uss) as tk:
             raw_pubkey = tk.get_pubkey()
 
         key = SSlibKey.from_crypto(MLDSA44PublicKey.from_public_bytes(raw_pubkey))
 
-        # Build URI with version query parameter
-        uri = f"{cls.SCHEME}:{device_path}?version={version}"
+        # Build URI with version and optional use_uss query parameters
+        query = {"version": str(version)}
+        if uss is not None:
+            query["use_uss"] = "true"
+
+        uri = f"{cls.SCHEME}:{device_path}?{parse.urlencode(query)}"
 
         return uri, key
 
@@ -684,7 +705,13 @@ class TKeySigner(Signer):
         digest = hashlib.sha512(payload).digest()
         formatted_msg = b"tuf" + bytes([1]) + digest
 
-        with _TKey(dev, self.version) as tk:
+        secret = None
+        if self.use_uss:
+            if self.secrets_handler is None:
+                raise ValueError("This TKey requires a secrets handler")
+            secret = self.secrets_handler("User Supplied Secret")
+
+        with _TKey(dev, self.version, secret=secret) as tk:
             sig_bytes = tk.sign(formatted_msg)
 
         return Signature(self.public_key.keyid, sig_bytes.hex())
