@@ -251,13 +251,17 @@ class _RawSerialConnection:
 class _TKey:
     """Client for a TKey ML-DSA signer application"""
 
-    def __init__(self, device: str) -> None:
+    def __init__(self, device: str, version: int) -> None:
         if PYSERIAL_IMPORT_ERROR:
             raise UnsupportedLibraryError(PYSERIAL_IMPORT_ERROR)
 
         self._port = device
         self._conn: _SerialConnection | None = None
         self._fid = 0
+        self.version = version
+        self.app_resource = files("securesystemslib.signer.tkey").joinpath(
+            f"app_v{version}.bin"
+        )
         self.connect(baudrate=62500, timeout=5.0)
 
     def connect(self, baudrate: int, timeout: float) -> None:
@@ -494,10 +498,12 @@ class _TKey:
         # 1. Try to query firmware mode name and version
         try:
             rx = self.send(Cmd.NAME_VERSION, 0, Endpoint.FW)
-            fw_name0 = data[2:6].decode("ascii").rstrip()
-            fw_name1 = data[6:10].decode("ascii").rstrip()
-            if fw_name0 != "tk1" or fwname1 != "mkdf":
-                raise TKeyError(f"TKey is running an unknown firmware {fw_name0, fw_name1}")
+            fw_name0 = rx[2:6].decode("ascii").rstrip()
+            fw_name1 = rx[6:10].decode("ascii").rstrip()
+            if fw_name0 != "tk1" or fw_name1 != "mkdf":
+                raise TKeyError(
+                    f"TKey is running an unknown firmware {fw_name0, fw_name1}"
+                )
         except TKeyError:
             # The running application rejected the firmware command, or timed out
             # Query application name and version
@@ -505,14 +511,15 @@ class _TKey:
             name0 = rx[2:6].decode("ascii").rstrip()
             name1 = rx[6:10].decode("ascii").rstrip()
             ver = int.from_bytes(rx[10:14], byteorder="little")
-            if name0 == "tk1" and name1 == "mlds" and ver == 4:
+            if name0 == "tk1" and name1 == "mlds" and ver == self.version:
                 # Signer application already loaded
                 return
-            raise TKeyError(f"TKey is running an unknown application {name0, name1, ver}")
+            raise TKeyError(
+                f"TKey is running an unknown application {name0, name1, ver}"
+            )
 
         # If we reached here, we are in firmware mode. Load the app
-        app_resource = files("securesystemslib.signer").joinpath("app.bin")
-        with as_file(app_resource) as app_path:
+        with as_file(self.app_resource) as app_path:
             self._load_app(str(app_path))
 
         if self._conn and self._conn.in_waiting:
@@ -595,6 +602,7 @@ class TKeySigner(Signer):
     def __init__(
         self,
         device_path: str | None,
+        version: int,
         public_key: SSlibKey,
         secrets_handler: SecretsHandler | None = None,
     ) -> None:
@@ -604,6 +612,7 @@ class TKeySigner(Signer):
         self.device_path = device_path
         self._public_key = public_key
         self.secrets_handler = secrets_handler
+        self.version = version
 
     @property
     def public_key(self) -> SSlibKey:
@@ -626,12 +635,22 @@ class TKeySigner(Signer):
         # Extract device path (empty or "/" triggers auto-detect)
         device_path = uri.path if uri.path not in ("", "/") else None
 
-        return cls(device_path, public_key, secrets_handler)
+        # Extract version from query parameter, default to 4
+        query_params = parse.parse_qs(uri.query)
+        version = 4
+        if "version" in query_params:
+            try:
+                version = int(query_params["version"][0])
+            except (ValueError, IndexError):
+                raise ValueError(f"Invalid version in URI: {priv_key_uri}")
+
+        return cls(device_path, version, public_key, secrets_handler)
 
     @classmethod
     def import_(
         cls,
         device_path: str | None = None,
+        version: int = 4,
     ) -> tuple[str, SSlibKey]:
         """Import public key and signer details from TKey device."""
         if device_path is None:
@@ -640,13 +659,13 @@ class TKeySigner(Signer):
                 raise ValueError("No TKey device found")
             device_path = devices[0]
 
-        with _TKey(device_path) as tk:
+        with _TKey(device_path, version) as tk:
             raw_pubkey = tk.get_pubkey()
 
         key = SSlibKey.from_crypto(MLDSA44PublicKey.from_public_bytes(raw_pubkey))
 
-        # Build URI
-        uri = f"{cls.SCHEME}:{device_path}"
+        # Build URI with version query parameter
+        uri = f"{cls.SCHEME}:{device_path}?version={version}"
 
         return uri, key
 
@@ -665,7 +684,7 @@ class TKeySigner(Signer):
         digest = hashlib.sha512(payload).digest()
         formatted_msg = b"tuf" + bytes([1]) + digest
 
-        with _TKey(dev) as tk:
+        with _TKey(dev, self.version) as tk:
             sig_bytes = tk.sign(formatted_msg)
 
         return Signature(self.public_key.keyid, sig_bytes.hex())

@@ -4,7 +4,7 @@ from securesystemslib.signer import Signer, SSlibKey, TKeySigner
 
 
 class TestTKeySigner(unittest.TestCase):
-    def test_tkey_signer_import_and_sign(self):
+    def test_tkey_signer_import_and_sign(self) -> None:
         """This test requires a physical Tillitis TKey to be available"""
 
         uri, pub_key = TKeySigner.import_()
