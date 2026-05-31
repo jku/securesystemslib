@@ -674,9 +674,11 @@ class TKeySigner(Signer):
             devices = _TKey.list_devices()
             if not devices:
                 raise ValueError("No TKey device found")
-            device_path = devices[0]
+            dev = devices[0]
+        else:
+            dev = device_path
 
-        with _TKey(device_path, version, secret=uss) as tk:
+        with _TKey(dev, version, secret=uss) as tk:
             raw_pubkey = tk.get_pubkey()
 
         key = SSlibKey.from_crypto(MLDSA44PublicKey.from_public_bytes(raw_pubkey))
@@ -686,7 +688,9 @@ class TKeySigner(Signer):
         if uss is not None:
             query["use_uss"] = "true"
 
-        uri = f"{cls.SCHEME}:{device_path}?{parse.urlencode(query)}"
+        # Only encode path if it was explicitly passed as argument
+        path = device_path if device_path is not None else ""
+        uri = f"{cls.SCHEME}:{path}?{parse.urlencode(query)}"
 
         return uri, key
 

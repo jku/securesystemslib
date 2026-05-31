@@ -102,16 +102,16 @@ class TestTKeySignerOffline(unittest.TestCase):
     @patch("securesystemslib.signer._tkey_signer.MLDSA44PublicKey.from_public_bytes")
     @patch("securesystemslib.signer._tkey_signer.SSlibKey.from_crypto")
     @patch.object(_TKey, "get_pubkey", return_value=b"dummy_pubkey_bytes")
+    @patch.object(_TKey, "list_devices", return_value=["/dev/ttyACM0"])
     def test_import_with_app_already_loaded(
         self,
+        mock_list_devices: MagicMock,
         mock_get_pubkey: MagicMock,
         mock_from_crypto: MagicMock,
         mock_from_public_bytes: MagicMock,
         mock_conn_class: MagicMock,
     ) -> None:
-        # Prepare connection mock
-        # 1st read returns b"" (timeout for NAME_VERSION FW command)
-        # 2nd read returns app_response (GET_NAME_VER_APP App command)
+        # Prepare connection mock (needs enough reads for two sequential import calls)
         app_name_payload = b"tk1 " + b"mlds" + (4).to_bytes(4, byteorder="little")
         app_response = make_response_frame(
             fid=2,
@@ -121,7 +121,7 @@ class TestTKeySignerOffline(unittest.TestCase):
             resp_id=Rsp.GET_NAME_VER_APP,
             data=app_name_payload,
         )
-        mock_conn = MockStreamConnection(reads=[b"", app_response])
+        mock_conn = MockStreamConnection(reads=[b"", app_response, b"", app_response])
         mock_conn_class.return_value = mock_conn
 
         # Mock keys
@@ -129,9 +129,16 @@ class TestTKeySignerOffline(unittest.TestCase):
         mock_from_crypto.return_value = mock_key
 
         with patch.object(_TKey, "_load_app") as mock_load_app:
+            # 1. Explicit path
             uri, key = TKeySigner.import_("/dev/ttyACM0", version=4)
             self.assertEqual(uri, "tkey:/dev/ttyACM0?version=4")
             self.assertEqual(key, mock_key)
+
+            # 2. Auto-detect path
+            uri, key = TKeySigner.import_(version=4)
+            self.assertEqual(uri, "tkey:?version=4")
+            self.assertEqual(key, mock_key)
+
             mock_load_app.assert_not_called()
 
     @patch("securesystemslib.signer._tkey_signer._RawSerialConnection")
