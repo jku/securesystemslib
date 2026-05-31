@@ -19,14 +19,11 @@ from securesystemslib.signer._key import Key, SSlibKey
 from securesystemslib.signer._signature import Signature
 from securesystemslib.signer._signer import SecretsHandler, Signer
 
-# Linux-specific stdlib modules
-LINUX_IMPORT_ERROR = None
-try:
+# Linux-specific stdlib modules: See _RawSerialConnection
+if sys.platform == "linux":
     import array
     import fcntl
     import termios
-except ImportError:
-    LINUX_IMPORT_ERROR = "linux modules only needed on linux"
 
 PYSERIAL_IMPORT_ERROR = None
 try:
@@ -410,7 +407,7 @@ class _TKey:
                 self._conn.read(resp_len)
             except Exception as e:
                 logger.debug("Failed to read remaining bytes after NOK status: %s", e)
-            raise TKeyError("Response status code not OK (1)")
+            raise TKeyProtocolError("Response status code not OK (1)")
 
         try:
             resp_data = self._conn.read(resp_len)
@@ -500,18 +497,18 @@ class _TKey:
         return digest
 
     def _ensure_app_loaded(self) -> None:
-        """Check if signer app is loaded on TKey, and load it in firmware mode."""
-        # 1. Try to query firmware mode name and version
+        """Load application if needed"""
         try:
+            # Query firmware name
             rx = self.send(Cmd.NAME_VERSION, 0, Endpoint.FW)
             fw_name0 = rx[2:6].decode("ascii").rstrip()
             fw_name1 = rx[6:10].decode("ascii").rstrip()
-            if fw_name0 != "tk1" or fw_name1 != "mkdf":
-                raise TKeyError(
-                    f"TKey is running an unknown firmware {fw_name0, fw_name1}"
-                )
+            is_fw = True
         except TKeyError:
-            # The running application rejected the firmware command, or timed out
+            # application rejected the firmware command, or timed out
+            is_fw = False
+
+        if not is_fw:
             # Query application name and version
             rx = self.send(Cmd.GET_NAME_VER_APP, 0, Endpoint.APP)
             name0 = rx[2:6].decode("ascii").rstrip()
@@ -521,10 +518,16 @@ class _TKey:
                 # Signer application already loaded
                 return
             raise TKeyError(
-                f"TKey is running an unknown application {name0, name1, ver}"
+                f"TKey is running an unknown application {name0, name1, ver}, "
+                f"expected ('tk1', 'mlds', {self.version})"
             )
 
-        # If we reached here, we are in firmware mode. Load the app
+        # we are in firmware mode. Load the app
+        if fw_name0 != "tk1" or fw_name1 != "mkdf":
+            raise TKeyError(
+                f"TKey is running an unknown firmware {fw_name0, fw_name1}"
+            )
+
         with as_file(self.app_resource) as app_path:
             self._load_app(str(app_path), secret=self.secret)
 
