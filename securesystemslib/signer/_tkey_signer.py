@@ -83,26 +83,30 @@ class Endpoint:
 
 
 class Cmd:
+    # FW commands:
     NAME_VERSION = 0x01
     LOAD_APP = 0x03
     LOAD_APP_DATA = 0x05
-    GET_KEY_CHUNK = 0x11
+    # App commands:
     SET_SIZE = 0x03
     SIGN_DATA = 0x05
     GET_SIG = 0x07
+    GET_KEY_CHUNK = 0x11
     GET_SIG_CHUNK = 0x13
     GET_NAME_VER_APP = 0x09
 
 
 class Rsp:
+    # FW Responses:
     NAME_VERSION = 0x02
     LOAD_APP = 0x04
     LOAD_APP_DATA = 0x06
     LOAD_APP_DATA_READY = 0x07
-    GET_KEY_CHUNK = 0x12
+    # App Responses:
     SET_SIZE = 0x04
     SIGN_DATA = 0x06
     GET_SIG = 0x08
+    GET_KEY_CHUNK = 0x12
     GET_SIG_CHUNK = 0x14
     GET_NAME_VER_APP = 0x0A
 
@@ -122,24 +126,21 @@ class LenIdx:
 class _RawSerialConnection:
     """A raw Python serial connection.
 
-    Uses standard os.open/ioctl configured in raw mode at 62500 baud.
+    This helper exists because pyserial just did not work with TKey
+    on linux
     """
 
     def __init__(self, port: str, baudrate: int, timeout: float) -> None:
         self.port = port
         self.baudrate = baudrate
         self.timeout = timeout
-        self.fd: int | None = None
-        self.open()
+        self.fd: int | None = self._open()
 
-    def open(self) -> None:
-        if self.fd is not None:
-            return
-
-        self.fd = os.open(self.port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+    def _open(self) -> int:
+        fd = os.open(self.port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
         try:
-            # 1. Use standard termios to configure raw 8N1 mode
-            attrs = termios.tcgetattr(self.fd)
+            # 1. Use termios to configure raw 8N1 mode
+            attrs = termios.tcgetattr(fd)
 
             # Clear input processing
             attrs[0] &= ~(
@@ -171,37 +172,37 @@ class _RawSerialConnection:
             )
             attrs[2] |= termios.CS8 | termios.CREAD | termios.CLOCAL
 
-            # Set speed elements to standard constant to avoid EINVAL on custom speeds
+            # Set speed using standard constants (this is changed below)
             attrs[4] = termios.B9600
             attrs[5] = termios.B9600
 
-            # Apply standard configuration
-            termios.tcsetattr(self.fd, termios.TCSANOW, attrs)
+            termios.tcsetattr(fd, termios.TCSANOW, attrs)
 
-            # 2. Use termios2 ioctls ONLY to set the custom 62500 baud rate
+            # 2. Use termios2 to set the custom 62500 baud rate
             tcgets2 = 0x802C542A
             tcsets2 = 0x402C542B
             bother = 0o010000
 
             buf = array.array("i", [0] * 64)
-            fcntl.ioctl(self.fd, tcgets2, buf)
+            fcntl.ioctl(fd, tcgets2, buf)
 
             buf[2] &= ~0x100F  # Clear CBAUD/CBAUDEX speed flags
             buf[2] |= bother  # Flag for custom speed (BOTHER)
             buf[9] = buf[10] = 62500  # Set custom speed
 
-            fcntl.ioctl(self.fd, tcsets2, buf)
+            fcntl.ioctl(fd, tcsets2, buf)
 
             # 3. Restore blocking mode
-            flags = fcntl.fcntl(self.fd, fcntl.F_GETFL)
-            fcntl.fcntl(self.fd, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
+            flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+            fcntl.fcntl(fd, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
 
             # 4. Acquire exclusive access
             tiocexcl = 0x540C
-            fcntl.ioctl(self.fd, tiocexcl, 0)
+            fcntl.ioctl(fd, tiocexcl, 0)
+
+            return fd
         except Exception:
-            os.close(self.fd)
-            self.fd = None
+            os.close(fd)
             raise
 
     def write(self, data: bytes) -> int:
@@ -248,7 +249,7 @@ class _RawSerialConnection:
 
 
 class _TKey:
-    """Minimal TKey connection and application loader."""
+    """Client for a TKey ML-DSA signer application"""
 
     def __init__(self, device: str) -> None:
         if PYSERIAL_IMPORT_ERROR:
@@ -435,15 +436,6 @@ class _TKey:
                 devices.append(port.device)
         return sorted(devices)
 
-    def get_name_version(self) -> tuple[str, str, int]:
-        # cmdNameVersion ID 0x01, length index 0 (1 byte)
-        response = self.send(Cmd.NAME_VERSION, 0, Endpoint.FW)
-        data = response[2:]
-        name0 = data[0:4].decode("ascii").rstrip()
-        name1 = data[4:8].decode("ascii").rstrip()
-        version = int.from_bytes(data[8:12], byteorder="little")
-        return name0, name1, version
-
     def _load_app(self, file_path: str, secret: str | None = None) -> None:
         try:
             file_size = os.path.getsize(file_path)
@@ -501,23 +493,22 @@ class _TKey:
         """Check if signer app is loaded on TKey, and load it in firmware mode."""
         # 1. Try to query firmware mode name and version
         try:
-            fw = self.get_name_version()
-            if fw[0] != "tk1" or fw[1] != "mkdf":
-                raise RuntimeError(f"TKey is running an unknown firmware {fw}")
+            rx = self.send(Cmd.NAME_VERSION, 0, Endpoint.FW)
+            fw_name0 = data[2:6].decode("ascii").rstrip()
+            fw_name1 = data[6:10].decode("ascii").rstrip()
+            if fw_name0 != "tk1" or fwname1 != "mkdf":
+                raise TKeyError(f"TKey is running an unknown firmware {fw_name0, fw_name1}")
         except TKeyError:
             # The running application rejected the firmware command, or timed out
             # Query application name and version
-            try:
-                # CMD_GET_NAME_VERSION_APP ID 0x09, length index 0 (1 byte)
-                rx = self.send(Cmd.GET_NAME_VER_APP, 0, Endpoint.APP)
-                name0 = rx[2:6].decode("ascii", errors="ignore").rstrip()
-                name1 = rx[6:10].decode("ascii", errors="ignore").rstrip()
-            except Exception as e:
-                raise RuntimeError("TKey is unresponsive") from e
-            if name0 == "tk1" and name1 == "mlds":
+            rx = self.send(Cmd.GET_NAME_VER_APP, 0, Endpoint.APP)
+            name0 = rx[2:6].decode("ascii").rstrip()
+            name1 = rx[6:10].decode("ascii").rstrip()
+            ver = int.from_bytes(rx[10:14], byteorder="little")
+            if name0 == "tk1" and name1 == "mlds" and ver == 4:
                 # Signer application already loaded
                 return
-            raise RuntimeError("TKey is running an unknown application")
+            raise TKeyError(f"TKey is running an unknown application {name0, name1, ver}")
 
         # If we reached here, we are in firmware mode. Load the app
         app_resource = files("securesystemslib.signer").joinpath("app.bin")
@@ -536,9 +527,9 @@ class _TKey:
             rx = self.send(Cmd.GET_KEY_CHUNK, 1, Endpoint.APP, tx_data)
 
             if rx[2] != 0:
-                raise ValueError(f"GetPubkeyChunk NOK status: {rx[2]}")
+                raise TKeyError(f"GetPubkeyChunk NOK status: {rx[2]}")
             if rx[3] != i:
-                raise ValueError(
+                raise TKeyError(
                     f"GetPubkeyChunk chunk index mismatch, expected {i}, got {rx[3]}"
                 )
 
@@ -570,7 +561,7 @@ class _TKey:
         rx = self.send(Cmd.GET_SIG, 0, Endpoint.APP, timeout=60)
 
         if rx[2] != 0x00:
-            raise TKeyProtocolError(f"Response NOK status: hex={rx.hex()}")
+            raise TKeyError(f"Response NOK status: hex={rx.hex()}")
 
         # 4. Fetch signature chunks (21 chunks)
         signature = bytearray(SIG_SIZE)
@@ -578,9 +569,9 @@ class _TKey:
             # CMD_GET_SIG_CHUNK ID 0x13, length index 1 (4 bytes)
             rx = self.send(Cmd.GET_SIG_CHUNK, 1, Endpoint.APP, bytes([i, 0, 0]))
             if rx[2] != 0:
-                raise ValueError(f"GetSigChunk NOK status: {rx[2]}")
+                raise TKeyError(f"GetSigChunk NOK status: {rx[2]}")
             if rx[3] != i:
-                raise ValueError(
+                raise TKeyError(
                     f"GetSigChunk chunk index mismatch, expected {i}, got {rx[3]}"
                 )
 
