@@ -67,36 +67,32 @@ class TestTKeySignerOffline(unittest.TestCase):
         self.mock_public_key.keyid = "mock_keyid"
 
     def test_from_priv_key_uri_parsing(self) -> None:
-        # 1. Default version (4) and no uss
-        signer = TKeySigner.from_priv_key_uri("tkey:/dev/ttyACM0", self.mock_public_key)
-        self.assertEqual(signer.device_path, "/dev/ttyACM0")
-        self.assertEqual(signer.version, 4)
-        self.assertFalse(signer.use_uss)
-
-        # 2. Custom version
+        # path and version
         signer = TKeySigner.from_priv_key_uri("tkey:/dev/ttyACM0?version=5", self.mock_public_key)
         self.assertEqual(signer.device_path, "/dev/ttyACM0")
         self.assertEqual(signer.version, 5)
 
-        # 3. No path, custom version
+        # version only
         signer = TKeySigner.from_priv_key_uri("tkey:?version=12", self.mock_public_key)
         self.assertIsNone(signer.device_path)
         self.assertEqual(signer.version, 12)
 
-        # 4. Invalid version format
+        # No version
+        with self.assertRaises(ValueError):
+            TKeySigner.from_priv_key_uri("tkey:/dev/ttyACM0", self.mock_public_key)
+
+        # Invalid version format
         with self.assertRaises(ValueError):
             TKeySigner.from_priv_key_uri("tkey:?version=invalid", self.mock_public_key)
 
-        # 5. Parsing use_uss
-        signer = TKeySigner.from_priv_key_uri("tkey:/dev/ttyACM0?use_uss=true", self.mock_public_key)
-        self.assertTrue(signer.use_uss)
-
-        signer = TKeySigner.from_priv_key_uri("tkey:/dev/ttyACM0?use_uss=false", self.mock_public_key)
-        self.assertFalse(signer.use_uss)
-
+        # Parsing use_uss
         signer = TKeySigner.from_priv_key_uri("tkey:/dev/ttyACM0?version=5&use_uss=true", self.mock_public_key)
         self.assertEqual(signer.version, 5)
         self.assertTrue(signer.use_uss)
+
+        signer = TKeySigner.from_priv_key_uri("tkey:/dev/ttyACM0?version=5&use_uss=false", self.mock_public_key)
+        self.assertFalse(signer.use_uss)
+
 
     @patch("securesystemslib.signer._tkey_signer._RawSerialConnection")
     @patch("securesystemslib.signer._tkey_signer.MLDSA44PublicKey.from_public_bytes")
@@ -144,10 +140,12 @@ class TestTKeySignerOffline(unittest.TestCase):
     @patch("securesystemslib.signer._tkey_signer._RawSerialConnection")
     @patch("securesystemslib.signer._tkey_signer.MLDSA44PublicKey.from_public_bytes")
     @patch("securesystemslib.signer._tkey_signer.SSlibKey.from_crypto")
+    @patch.object(_TKey, "_find_device", return_value="/dev/ttyACM0")
     @patch.object(_TKey, "get_pubkey", return_value=b"dummy_pubkey_bytes")
     def test_import_with_app_loaded_mismatched_version(
         self,
         mock_get_pubkey: MagicMock,
+        mock_find_device: MagicMock,
         mock_from_crypto: MagicMock,
         mock_from_public_bytes: MagicMock,
         mock_conn_class: MagicMock,
@@ -173,10 +171,12 @@ class TestTKeySignerOffline(unittest.TestCase):
     @patch("securesystemslib.signer._tkey_signer._RawSerialConnection")
     @patch("securesystemslib.signer._tkey_signer.MLDSA44PublicKey.from_public_bytes")
     @patch("securesystemslib.signer._tkey_signer.SSlibKey.from_crypto")
+    @patch.object(_TKey, "_find_device", return_value="/dev/ttyACM0")
     @patch.object(_TKey, "get_pubkey", return_value=b"dummy_pubkey_bytes")
     def test_import_in_firmware_mode_loads_correct_version(
         self,
         mock_get_pubkey: MagicMock,
+        mock_find_device: MagicMock,
         mock_from_crypto: MagicMock,
         mock_from_public_bytes: MagicMock,
         mock_conn_class: MagicMock,
@@ -211,10 +211,12 @@ class TestTKeySignerOffline(unittest.TestCase):
     @patch("securesystemslib.signer._tkey_signer._RawSerialConnection")
     @patch("securesystemslib.signer._tkey_signer.MLDSA44PublicKey.from_public_bytes")
     @patch("securesystemslib.signer._tkey_signer.SSlibKey.from_crypto")
+    @patch.object(_TKey, "_find_device", return_value="/dev/ttyACM0")
     @patch.object(_TKey, "get_pubkey", return_value=b"dummy_pubkey_bytes")
     def test_import_with_uss(
         self,
         mock_get_pubkey: MagicMock,
+        mock_find_device: MagicMock,
         mock_from_crypto: MagicMock,
         mock_from_public_bytes: MagicMock,
         mock_conn_class: MagicMock,

@@ -650,12 +650,9 @@ class TKeySigner(Signer):
         # Extract query parameters
         query_params = parse.parse_qs(uri.query)
 
-        version = 4
-        if "version" in query_params:
-            try:
-                version = int(query_params["version"][0])
-            except (ValueError, IndexError):
-                raise ValueError(f"Invalid version in URI: {priv_key_uri}")
+        if "version" not in query_params:
+            raise ValueError("TKey URI must include 'version'")
+        version = int(query_params["version"][0])
 
         use_uss_str = query_params.get("use_uss", ["false"])[0]
         use_uss = use_uss_str.lower() == "true"
