@@ -14,11 +14,7 @@ from urllib import parse
 
 from cryptography.hazmat.primitives.asymmetric.mldsa import MLDSA44PublicKey
 
-from securesystemslib.exceptions import (
-    Error,
-    UnsupportedLibraryError,
-    UnverifiedSignatureError,
-)
+from securesystemslib.exceptions import Error, UnsupportedLibraryError
 from securesystemslib.signer._key import Key, SSlibKey
 from securesystemslib.signer._signature import Signature
 from securesystemslib.signer._signer import SecretsHandler, Signer
@@ -508,34 +504,32 @@ class _TKey:
         return digest
 
     def _ensure_app_loaded(self, secret: str | None) -> None:
-        """Load application if needed"""
+        """Load application if needed
+
+        Note that if the application is already loaded, we cannot verify that
+        it was loaded with the same secret.
+        """
         try:
             # Query firmware name
             rx = self.send(Cmd.NAME_VERSION, 0, Endpoint.FW)
-            fw_name0 = rx[2:6].decode("ascii").rstrip()
-            fw_name1 = rx[6:10].decode("ascii").rstrip()
-            is_fw = True
         except TKeyError:
-            # application rejected the firmware command, or timed out
-            is_fw = False
-
-        if not is_fw:
+            # application rejected the firmware command, or timed out.
             # Query application name and version
             rx = self.send(Cmd.GET_NAME_VER_APP, 0, Endpoint.APP)
             name0 = rx[2:6].decode("ascii").rstrip()
             name1 = rx[6:10].decode("ascii").rstrip()
             ver = int.from_bytes(rx[10:14], byteorder="little")
             if name0 == "tk1" and name1 == "mlds" and ver == self.version:
-                # Signer application already loaded. Note that we just assume
-                # the secret that was originally used matches our secret.
-                # Caller needs to check public key to actually verify
-                return
+                return  # Signer application is already loaded
+
             raise TKeyError(
                 f"TKey is running an unknown application {name0, name1, ver}, "
                 f"expected ('tk1', 'mlds', {self.version})"
             )
 
         # we are in firmware mode. Load the app
+        fw_name0 = rx[2:6].decode("ascii").rstrip()
+        fw_name1 = rx[6:10].decode("ascii").rstrip()
         if fw_name0 != "tk1" or fw_name1 != "mkdf":
             raise TKeyError(f"TKey is running an unknown firmware {fw_name0, fw_name1}")
 
@@ -631,16 +625,25 @@ class TKeySigner(Signer):
         version: int,
         public_key: SSlibKey,
         secrets_handler: SecretsHandler | None = None,
-        use_uss: bool = False,
     ) -> None:
         if public_key.scheme != "ml-dsa-44/1":
             raise ValueError(f"unsupported scheme {public_key.scheme}")
 
         self.device_path = device_path
         self._public_key = public_key
-        self.secrets_handler = secrets_handler
         self.version = version
-        self.use_uss = use_uss
+
+        uss = secrets_handler("User Supplied Secret") if secrets_handler else None
+        self._tkey = _TKey(self.device_path, self.version, uss)
+
+        # key derivation depends on USS: compare keys to make sure USS is right
+        raw_pubkey = self._tkey.get_pubkey()
+        key = SSlibKey.from_crypto(MLDSA44PublicKey.from_public_bytes(raw_pubkey))
+        if key.keyval != self.public_key.keyval:
+            raise TKeyError(
+                "TKey public key does not match: This can mean incorrect "
+                "User Supplied Secret."
+            )
 
     @property
     def public_key(self) -> SSlibKey:
@@ -671,14 +674,16 @@ class TKeySigner(Signer):
         version = int(query_params["version"][0])
 
         use_uss_str = query_params.get("use_uss", ["false"])[0]
-        use_uss = use_uss_str.lower() == "true"
+        if use_uss_str.lower() != "true":
+            secrets_handler = None
+        elif secrets_handler is None:
+            raise ValueError("TKey URI has 'use_uss' but no secrets_handler was given")
 
         return cls(
             device_path,
             version,
             public_key,
             secrets_handler,
-            use_uss,
         )
 
     @classmethod
@@ -721,23 +726,5 @@ class TKeySigner(Signer):
         digest = hashlib.sha512(payload).digest()
         formatted_msg = b"tuf" + bytes([1]) + digest
 
-        uss = None
-        if self.use_uss:
-            if self.secrets_handler is None:
-                raise ValueError("This TKey requires a secrets handler")
-            uss = self.secrets_handler("User Supplied Secret")
-
-        with _TKey(self.device_path, self.version, uss) as tk:
-            sig_bytes = tk.sign(formatted_msg)
-
-        # Verify to make sure the key was actually correct
-        try:
-            signature = Signature(self.public_key.keyid, sig_bytes.hex())
-            self.public_key.verify_signature(signature, payload)
-        except UnverifiedSignatureError:
-            raise TKeyError(
-                "TKey signature failed to verify: This could mean incorrect "
-                "application or User Supplied Secret."
-            )
-
-        return signature
+        sig_bytes = self._tkey.sign(formatted_msg)
+        return Signature(self.public_key.keyid, sig_bytes.hex())

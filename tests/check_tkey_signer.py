@@ -5,7 +5,10 @@ from securesystemslib.signer import Signer, SSlibKey, TKeySigner
 
 class TestTKeySigner(unittest.TestCase):
     def test_tkey_signer_import_and_sign(self) -> None:
-        """This test requires a physical Tillitis TKey to be available"""
+        """This test requires
+        * a physical Tillitis TKey to be connected
+        * a touch on the key when it blinks green
+        """
 
         def uss(_: str) -> str:
             return "hunter2"
