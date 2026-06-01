@@ -260,7 +260,7 @@ class _TKey:
         self,
         device: str | None,
         version: int,
-        secret: str | None = None,
+        secret: str | None,
     ) -> None:
         if PYSERIAL_IMPORT_ERROR:
             raise UnsupportedLibraryError(PYSERIAL_IMPORT_ERROR)
@@ -268,10 +268,9 @@ class _TKey:
         self._conn: _SerialConnection | None = None
         self._fid = 0
         self.version = version
-        self.secret = secret
 
         self._connect(device, baudrate=62500, timeout=5.0)
-        self._ensure_app_loaded()
+        self._ensure_app_loaded(secret)
 
     @staticmethod
     def _find_device(device_path: str | None) -> str:
@@ -508,7 +507,7 @@ class _TKey:
 
         return digest
 
-    def _ensure_app_loaded(self) -> None:
+    def _ensure_app_loaded(self, secret: str | None) -> None:
         """Load application if needed"""
         try:
             # Query firmware name
@@ -545,7 +544,7 @@ class _TKey:
         )
         try:
             with as_file(app_resource) as app_path:
-                self._load_app(str(app_path), secret=self.secret)
+                self._load_app(str(app_path), secret=secret)
         except TKeyAppError as e:
             raise TKeyAppError(
                 f"Failed to load application version {self.version}"
@@ -699,7 +698,7 @@ class TKeySigner(Signer):
             uss: Optional "User Supplied Secret". Will be used as part of the seed for
                 the ML-DSA key
         """
-        with _TKey(device_path, version, secret=uss) as tk:
+        with _TKey(device_path, version, uss) as tk:
             raw_pubkey = tk.get_pubkey()
 
         key = SSlibKey.from_crypto(MLDSA44PublicKey.from_public_bytes(raw_pubkey))
@@ -722,13 +721,13 @@ class TKeySigner(Signer):
         digest = hashlib.sha512(payload).digest()
         formatted_msg = b"tuf" + bytes([1]) + digest
 
-        secret = None
+        uss = None
         if self.use_uss:
             if self.secrets_handler is None:
                 raise ValueError("This TKey requires a secrets handler")
-            secret = self.secrets_handler("User Supplied Secret")
+            uss = self.secrets_handler("User Supplied Secret")
 
-        with _TKey(self.device_path, self.version, secret=secret) as tk:
+        with _TKey(self.device_path, self.version, uss) as tk:
             sig_bytes = tk.sign(formatted_msg)
 
         # Verify to make sure the key was actually correct
