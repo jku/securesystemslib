@@ -14,7 +14,11 @@ from urllib import parse
 
 from cryptography.hazmat.primitives.asymmetric.mldsa import MLDSA44PublicKey
 
-from securesystemslib.exceptions import Error, UnsupportedLibraryError
+from securesystemslib.exceptions import (
+    Error,
+    UnsupportedLibraryError,
+    UnverifiedSignatureError,
+)
 from securesystemslib.signer._key import Key, SSlibKey
 from securesystemslib.signer._signature import Signature
 from securesystemslib.signer._signer import SecretsHandler, Signer
@@ -52,6 +56,10 @@ KEY_CHUNKS = KEY_SIZE // CHUNK_SIZE
 
 class TKeyError(Error):
     """Base class for TKey errors."""
+
+
+class TKeyAppError(TKeyError):
+    """Raised loading the signer application fails."""
 
 
 class TKeyIOError(TKeyError):
@@ -261,9 +269,6 @@ class _TKey:
         self._fid = 0
         self.version = version
         self.secret = secret
-        self.app_resource = files("securesystemslib.signer.tkey").joinpath(
-            f"app_v{version}.bin"
-        )
 
         self._connect(device, baudrate=62500, timeout=5.0)
         self._ensure_app_loaded()
@@ -454,10 +459,12 @@ class _TKey:
             with open(file_path, "rb") as f:
                 file_data = f.read()
         except Exception as e:
-            raise TKeyError(f"Failed to read app file {file_path}: {e}") from e
+            raise TKeyAppError(f"Failed to read application binary {file_path}") from e
 
         if file_size > APP_MAXSIZE:
-            raise TKeyError(f"File too big ({file_size} > {APP_MAXSIZE})")
+            raise TKeyAppError(
+                f"Application binary is too large ({file_size} > {APP_MAXSIZE})"
+            )
 
         file_digest = hashlib.blake2s(file_data, digest_size=32).digest()
 
@@ -471,11 +478,11 @@ class _TKey:
 
         response = self.send(Cmd.LOAD_APP, 3, Endpoint.FW, bytes(data))
         if response[2] == 1:
-            raise TKeyError("Device not ready (STATUS_BAD)")
+            raise TKeyAppError("Device not ready (STATUS_BAD)")
 
         result_digest = self._load_app_data(file_data)
         if file_digest != result_digest:
-            raise TKeyError(
+            raise TKeyAppError(
                 "Hash digests do not match "
                 f"({file_digest.hex()} != {result_digest.hex()})"
             )
@@ -520,7 +527,9 @@ class _TKey:
             name1 = rx[6:10].decode("ascii").rstrip()
             ver = int.from_bytes(rx[10:14], byteorder="little")
             if name0 == "tk1" and name1 == "mlds" and ver == self.version:
-                # Signer application already loaded
+                # Signer application already loaded. Note that we just assume
+                # the secret that was originally used matches our secret.
+                # Caller needs to check public key to actually verify
                 return
             raise TKeyError(
                 f"TKey is running an unknown application {name0, name1, ver}, "
@@ -531,8 +540,16 @@ class _TKey:
         if fw_name0 != "tk1" or fw_name1 != "mkdf":
             raise TKeyError(f"TKey is running an unknown firmware {fw_name0, fw_name1}")
 
-        with as_file(self.app_resource) as app_path:
-            self._load_app(str(app_path), secret=self.secret)
+        app_resource = files("securesystemslib.signer.tkey").joinpath(
+            f"app_v{self.version}.bin"
+        )
+        try:
+            with as_file(app_resource) as app_path:
+                self._load_app(str(app_path), secret=self.secret)
+        except TKeyAppError as e:
+            raise TKeyAppError(
+                f"Failed to load application version {self.version}"
+            ) from e
 
         if self._conn and self._conn.in_waiting:
             self._conn.read(self._conn.in_waiting)
@@ -714,4 +731,14 @@ class TKeySigner(Signer):
         with _TKey(self.device_path, self.version, secret=secret) as tk:
             sig_bytes = tk.sign(formatted_msg)
 
-        return Signature(self.public_key.keyid, sig_bytes.hex())
+        # Verify to make sure the key was actually correct
+        try:
+            signature = Signature(self.public_key.keyid, sig_bytes.hex())
+            self.public_key.verify_signature(signature, payload)
+        except UnverifiedSignatureError:
+            raise TKeyError(
+                "TKey signature failed to verify: This could mean incorrect "
+                "application or User Supplied Secret."
+            )
+
+        return signature

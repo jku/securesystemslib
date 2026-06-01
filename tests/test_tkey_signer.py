@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import ANY, MagicMock, patch
 from urllib import parse
 
+from securesystemslib.exceptions import UnverifiedSignatureError
 from securesystemslib.signer import SSlibKey
 from securesystemslib.signer._tkey_signer import (
     PROTO_DATA_LENGTH,
@@ -286,6 +287,43 @@ class TestTKeySignerOffline(unittest.TestCase):
             secrets_handler.assert_called_once_with("User Supplied Secret")
             # _TKey constructor should have been called with secret="mysecret"
             mock_tkey_class.assert_called_once_with("/dev/ttyACM0", 4, secret="mysecret")
+
+    @patch("securesystemslib.signer._tkey_signer._RawSerialConnection")
+    def test_sign_verification_failure(self, mock_conn_class: MagicMock) -> None:
+        # Mock connection so connect doesn't reload the app (app already loaded)
+        app_name_payload = b"tk1 " + b"mlds" + (4).to_bytes(4, byteorder="little")
+        app_response = make_response_frame(
+            fid=2,
+            eid=Endpoint.APP,
+            status=0,
+            len_idx=LenIdx.I32,
+            resp_id=Rsp.GET_NAME_VER_APP,
+            data=app_name_payload,
+        )
+        mock_conn = MockStreamConnection(reads=[b"", app_response])
+        mock_conn_class.return_value = mock_conn
+
+        # Mock key that fails verify -- could happen if application or USS is incorrect
+        mock_public_key = MagicMock(spec=SSlibKey)
+        mock_public_key.scheme = "ml-dsa-44/1"
+        mock_public_key.keyid = "mock_keyid"
+        mock_public_key.verify_signature.side_effect = UnverifiedSignatureError("Verification failed")
+
+        signer = TKeySigner(
+            device_path="/dev/ttyACM0",
+            version=4,
+            public_key=mock_public_key,
+        )
+
+        with patch("securesystemslib.signer._tkey_signer._TKey") as mock_tkey_class:
+            mock_tk_inst = MagicMock()
+            mock_tk_inst.sign.return_value = b"dummy_signature"
+            mock_tk_inst.__enter__.return_value = mock_tk_inst
+            mock_tkey_class.return_value = mock_tk_inst
+
+            with self.assertRaises(TKeyError) as ctx:
+                signer.sign(b"mypayload")
+            self.assertIn("could mean incorrect application or User Supplied Secret", str(ctx.exception))
 
     def test_sign_with_uss_missing_secrets_handler(self) -> None:
         signer = TKeySigner(
