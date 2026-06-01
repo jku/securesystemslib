@@ -102,10 +102,10 @@ class TestTKeySignerOffline(unittest.TestCase):
     @patch("securesystemslib.signer._tkey_signer.MLDSA44PublicKey.from_public_bytes")
     @patch("securesystemslib.signer._tkey_signer.SSlibKey.from_crypto")
     @patch.object(_TKey, "get_pubkey", return_value=b"dummy_pubkey_bytes")
-    @patch.object(_TKey, "list_devices", return_value=["/dev/ttyACM0"])
+    @patch.object(_TKey, "_find_device", return_value="/dev/ttyACM0")
     def test_import_with_app_already_loaded(
         self,
-        mock_list_devices: MagicMock,
+        mock_find_device: MagicMock,
         mock_get_pubkey: MagicMock,
         mock_from_crypto: MagicMock,
         mock_from_public_bytes: MagicMock,

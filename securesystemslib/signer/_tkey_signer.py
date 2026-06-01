@@ -250,14 +250,13 @@ class _TKey:
 
     def __init__(
         self,
-        device: str,
+        device: str | None,
         version: int,
         secret: str | None = None,
     ) -> None:
         if PYSERIAL_IMPORT_ERROR:
             raise UnsupportedLibraryError(PYSERIAL_IMPORT_ERROR)
 
-        self._port = device
         self._conn: _SerialConnection | None = None
         self._fid = 0
         self.version = version
@@ -265,19 +264,37 @@ class _TKey:
         self.app_resource = files("securesystemslib.signer.tkey").joinpath(
             f"app_v{version}.bin"
         )
-        self.connect(baudrate=62500, timeout=5.0)
 
-    def connect(self, baudrate: int, timeout: float) -> None:
+        self._connect(device, baudrate=62500, timeout=5.0)
+        self._ensure_app_loaded()
+
+    @staticmethod
+    def _find_device(device_path: str | None) -> str:
+        """Discover TKey device serial port using pyserial."""
+
+        ports = list_ports.comports()
+        devices = sorted(
+            p.device for p in ports if p.vid == TKEY_USB_VID and p.pid == TKEY_USB_PID
+        )
+
+        if device_path is None:
+            if not devices:
+                raise TKeyError("No TKey devices found")
+            device_path = devices[0]
+        elif device_path not in devices:
+            raise TKeyError(f"TKey device {device_path} not found")
+        return device_path
+
+    def _connect(self, device: str | None, baudrate: int, timeout: float) -> None:
+        port = self._find_device(device)
+
         if sys.platform == "linux":
-            self._conn = _RawSerialConnection(self._port, baudrate, timeout)
+            self._conn = _RawSerialConnection(port, baudrate, timeout)
         else:
             try:
-                self._conn = serial.Serial(
-                    self._port, baudrate=baudrate, timeout=timeout
-                )
+                self._conn = serial.Serial(port, baudrate=baudrate, timeout=timeout)
             except Exception as e:
-                raise TKeyError(f"Failed to open serial port {self._port}: {e}") from e
-        self._ensure_app_loaded()
+                raise TKeyError(f"Failed to open serial port {port}: {e}") from e
 
     def disconnect(self) -> None:
         if self._conn is not None:
@@ -431,18 +448,6 @@ class _TKey:
         response[1:] = resp_data
         return bytes(response)
 
-    @classmethod
-    def list_devices(cls) -> list[str]:
-        """Discover TKey device paths using pyserial."""
-        if PYSERIAL_IMPORT_ERROR:
-            raise UnsupportedLibraryError(PYSERIAL_IMPORT_ERROR)
-
-        devices = []
-        for port in list_ports.comports():
-            if port.vid == TKEY_USB_VID and port.pid == TKEY_USB_PID:
-                devices.append(port.device)
-        return sorted(devices)
-
     def _load_app(self, file_path: str, secret: str | None = None) -> None:
         try:
             file_size = os.path.getsize(file_path)
@@ -524,9 +529,7 @@ class _TKey:
 
         # we are in firmware mode. Load the app
         if fw_name0 != "tk1" or fw_name1 != "mkdf":
-            raise TKeyError(
-                f"TKey is running an unknown firmware {fw_name0, fw_name1}"
-            )
+            raise TKeyError(f"TKey is running an unknown firmware {fw_name0, fw_name1}")
 
         with as_file(self.app_resource) as app_path:
             self._load_app(str(app_path), secret=self.secret)
@@ -672,16 +675,17 @@ class TKeySigner(Signer):
         version: int = 4,
         uss: str | None = None,
     ) -> tuple[str, SSlibKey]:
-        """Import public key and signer details from TKey device."""
-        if device_path is None:
-            devices = _TKey.list_devices()
-            if not devices:
-                raise ValueError("No TKey device found")
-            dev = devices[0]
-        else:
-            dev = device_path
+        """Import public key and signer details from a TKey device.
 
-        with _TKey(dev, version, secret=uss) as tk:
+        Arguments:
+            device path: Optional COM port path. Typically not useful as the port may
+                be dynamic
+            version: Optional version of device binary. Should not be set unless a
+                non-default version is required
+            uss: Optional "User Supplied Secret". Will be used as part of the seed for
+                the ML-DSA key
+        """
+        with _TKey(device_path, version, secret=uss) as tk:
             raw_pubkey = tk.get_pubkey()
 
         key = SSlibKey.from_crypto(MLDSA44PublicKey.from_public_bytes(raw_pubkey))
@@ -699,14 +703,6 @@ class TKeySigner(Signer):
 
     def sign(self, payload: bytes) -> Signature:
         """Signs payload with Tillitis TKey."""
-        # 1. Connect to TKey and make sure the app is loaded
-        # Find device
-        dev = self.device_path
-        if dev is None:
-            devices = _TKey.list_devices()
-            if not devices:
-                raise RuntimeError("No TKey device found")
-            dev = devices[0]
 
         # Use TUF-specific message prefix
         digest = hashlib.sha512(payload).digest()
@@ -718,7 +714,7 @@ class TKeySigner(Signer):
                 raise ValueError("This TKey requires a secrets handler")
             secret = self.secrets_handler("User Supplied Secret")
 
-        with _TKey(dev, self.version, secret=secret) as tk:
+        with _TKey(self.device_path, self.version, secret=secret) as tk:
             sig_bytes = tk.sign(formatted_msg)
 
         return Signature(self.public_key.keyid, sig_bytes.hex())
