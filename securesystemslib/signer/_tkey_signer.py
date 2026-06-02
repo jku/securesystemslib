@@ -718,7 +718,7 @@ class TKeySigner(Signer):
         # Build URI with version and optional passphrase query parameters
         query = {"version": str(version)}
         if passphrase is not None:
-            query["passphrase"] = "true"
+            query["passphrase"] = "true"  # noqa: S105
 
         # Only encode path if it was explicitly passed as argument
         path = device_path if device_path is not None else ""
