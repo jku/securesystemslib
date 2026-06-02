@@ -132,13 +132,11 @@ class _RawSerialConnection:
     """
 
     def __init__(self, port: str, baudrate: int, timeout: float) -> None:
-        self.port = port
-        self.baudrate = baudrate
         self.timeout = timeout
-        self.fd: int | None = self._open()
+        self._fd: int | None = self._open(port, baudrate)
 
-    def _open(self) -> int:
-        fd = os.open(self.port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+    def _open(self, port: str, baudrate: int) -> int:
+        fd = os.open(port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
         try:
             # 1. Use termios to configure raw 8N1 mode
             attrs = termios.tcgetattr(fd)
@@ -189,7 +187,7 @@ class _RawSerialConnection:
 
             buf[2] &= ~0x100F  # Clear CBAUD/CBAUDEX speed flags
             buf[2] |= bother  # Flag for custom speed (BOTHER)
-            buf[9] = buf[10] = 62500  # Set custom speed
+            buf[9] = buf[10] = baudrate  # Set custom speed
 
             fcntl.ioctl(fd, tcsets2, buf)
 
@@ -207,20 +205,20 @@ class _RawSerialConnection:
             raise
 
     def write(self, data: bytes) -> int:
-        if self.fd is None:
+        if self._fd is None:
             raise ValueError("Port is closed")
-        return os.write(self.fd, data)
+        return os.write(self._fd, data)
 
     def read(self, n: int) -> bytes:
         """Read exactly n bytes blockingly, respecting the configured timeout."""
-        if self.fd is None:
+        if self._fd is None:
             raise ValueError("Port is closed")
         data = bytearray()
         while len(data) < n:
-            r, _, _ = select.select([self.fd], [], [], self.timeout)
+            r, _, _ = select.select([self._fd], [], [], self.timeout)
             if not r:
                 break  # Timeout
-            chunk = os.read(self.fd, n - len(data))
+            chunk = os.read(self._fd, n - len(data))
             if len(chunk) == 0:
                 break  # EOF/Disconnect
             data.extend(chunk)
@@ -234,19 +232,19 @@ class _RawSerialConnection:
 
     @property
     def in_waiting(self) -> int:
-        if self.fd is None:
+        if self._fd is None:
             return 0
         buf = array.array("i", [0])
         try:
-            fcntl.ioctl(self.fd, termios.FIONREAD, buf)
+            fcntl.ioctl(self._fd, termios.FIONREAD, buf)
             return buf[0]
         except Exception:
             return 0
 
     def close(self) -> None:
-        if self.fd is not None:
-            os.close(self.fd)
-            self.fd = None
+        if self._fd is not None:
+            os.close(self._fd)
+            self._fd = None
 
 
 class _TKey:
@@ -263,7 +261,7 @@ class _TKey:
 
         self._conn: _SerialConnection | None = None
         self._fid = 0
-        self.version = version
+        self._version = version
 
         self._connect(device, baudrate=62500, timeout=5.0)
         self._ensure_app_loaded(secret)
@@ -519,12 +517,12 @@ class _TKey:
             name0 = rx[2:6].decode("ascii").rstrip()
             name1 = rx[6:10].decode("ascii").rstrip()
             ver = int.from_bytes(rx[10:14], byteorder="little")
-            if name0 == "tk1" and name1 == "mlds" and ver == self.version:
+            if name0 == "tk1" and name1 == "mlds" and ver == self._version:
                 return  # Signer application is already loaded
 
             raise TKeyError(
                 f"TKey is running an unknown application {name0, name1, ver}, "
-                f"expected ('tk1', 'mlds', {self.version})"
+                f"expected ('tk1', 'mlds', {self._version})"
             )
 
         # we are in firmware mode. Load the app
@@ -534,14 +532,14 @@ class _TKey:
             raise TKeyError(f"TKey is running an unknown firmware {fw_name0, fw_name1}")
 
         app_resource = files("securesystemslib.signer.tkey").joinpath(
-            f"app_v{self.version}.bin"
+            f"app_v{self._version}.bin"
         )
         try:
             with as_file(app_resource) as app_path:
                 self._load_app(str(app_path), secret=secret)
         except TKeyAppError as e:
             raise TKeyAppError(
-                f"Failed to load application version {self.version}"
+                f"Failed to load application version {self._version}"
             ) from e
 
         if self._conn and self._conn.in_waiting:
