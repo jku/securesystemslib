@@ -468,8 +468,8 @@ class _TKey:
         data[0:4] = file_size.to_bytes(4, byteorder="little")
         if secret is not None:
             data[4] = 1
-            encoded_secret = secret.encode("utf-8")
-            data[5 : 5 + len(encoded_secret)] = encoded_secret
+            uss = hashlib.blake2s(secret.encode("utf-8"), digest_size=32)
+            data[5 : 5 + 32] = uss.digest()
 
         response = self.send(Cmd.LOAD_APP, 3, Endpoint.FW, bytes(data))
         if response[2] == 1:
@@ -615,6 +615,16 @@ class TKeySigner(Signer):
     """Tillitis TKey Signer.
 
     Supports signing scheme "ml-dsa-44/1".
+
+    The private key URI is
+        tkey:[device_path]?version=<N>&[passphrase=true]
+    Version is required, device path is not (and is not
+    typically useful).
+
+    Examples:
+        tkey:?version=4
+        tkey:?version=4&passphrase=true
+        tkey:/dev/ttyACM0?version=4&passphrase=true
     """
 
     SCHEME = "tkey"
@@ -629,20 +639,17 @@ class TKeySigner(Signer):
         if public_key.scheme != "ml-dsa-44/1":
             raise ValueError(f"unsupported scheme {public_key.scheme}")
 
-        self.device_path = device_path
         self._public_key = public_key
-        self.version = version
 
-        uss = secrets_handler("User Supplied Secret") if secrets_handler else None
-        self._tkey = _TKey(self.device_path, self.version, uss)
+        passphrase = secrets_handler("Passphrase") if secrets_handler else None
+        self._tkey = _TKey(device_path, version, passphrase)
 
-        # key derivation depends on USS: compare keys to make sure USS is right
+        # key derivation depends on passphrase: compare keys to make sure
         raw_pubkey = self._tkey.get_pubkey()
         key = SSlibKey.from_crypto(MLDSA44PublicKey.from_public_bytes(raw_pubkey))
         if key.keyval != self.public_key.keyval:
             raise TKeyError(
-                "TKey public key does not match: This can mean incorrect "
-                "User Supplied Secret."
+                "TKey public key does not match: This could mean incorrect Passphrase."
             )
 
     @property
@@ -673,11 +680,13 @@ class TKeySigner(Signer):
             raise ValueError("TKey URI must include 'version'")
         version = int(query_params["version"][0])
 
-        use_uss_str = query_params.get("use_uss", ["false"])[0]
-        if use_uss_str.lower() != "true":
+        pass_str = query_params.get("passphrase", ["false"])[0]
+        if pass_str.lower() != "true":
             secrets_handler = None
         elif secrets_handler is None:
-            raise ValueError("TKey URI has 'use_uss' but no secrets_handler was given")
+            raise ValueError(
+                "TKey URI has 'passphrase' but no secrets_handler was given"
+            )
 
         return cls(
             device_path,
@@ -691,7 +700,7 @@ class TKeySigner(Signer):
         cls,
         device_path: str | None = None,
         version: int = 4,
-        uss: str | None = None,
+        passphrase: str | None = None,
     ) -> tuple[str, SSlibKey]:
         """Import public key and signer details from a TKey device.
 
@@ -700,18 +709,18 @@ class TKeySigner(Signer):
                 be dynamic
             version: Optional version of device binary. Should not be set unless a
                 non-default version is required
-            uss: Optional "User Supplied Secret". Will be used as part of the seed for
-                the ML-DSA key
+            passphrase: Optional "User Supplied Secret". Will be used as part of the
+                seed for the ML-DSA key
         """
-        with _TKey(device_path, version, uss) as tk:
+        with _TKey(device_path, version, passphrase) as tk:
             raw_pubkey = tk.get_pubkey()
 
         key = SSlibKey.from_crypto(MLDSA44PublicKey.from_public_bytes(raw_pubkey))
 
-        # Build URI with version and optional use_uss query parameters
+        # Build URI with version and optional passphrase query parameters
         query = {"version": str(version)}
-        if uss is not None:
-            query["use_uss"] = "true"
+        if passphrase is not None:
+            query["passphrase"] = "true"
 
         # Only encode path if it was explicitly passed as argument
         path = device_path if device_path is not None else ""
