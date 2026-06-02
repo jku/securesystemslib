@@ -7,7 +7,8 @@ import logging
 import os
 import select
 import sys
-from importlib.resources import as_file, files
+from dataclasses import dataclass
+from importlib.resources import files
 from types import TracebackType
 from typing import Protocol
 from urllib import parse
@@ -247,24 +248,28 @@ class _RawSerialConnection:
             self._fd = None
 
 
+@dataclass
+class _TKeyApp:
+    binary: bytes
+    name: tuple[str, str]
+    version: int
+
+
 class _TKey:
     """Client for a TKey ML-DSA signer application"""
 
     def __init__(
         self,
         device: str | None,
-        version: int,
+        app: _TKeyApp,
         secret: str | None,
     ) -> None:
-        if PYSERIAL_IMPORT_ERROR:
-            raise UnsupportedLibraryError(PYSERIAL_IMPORT_ERROR)
 
         self._conn: _SerialConnection | None = None
         self._fid = 0
-        self._version = version
 
         self._connect(device, baudrate=62500, timeout=5.0)
-        self._ensure_app_loaded(secret)
+        self._ensure_app_loaded(app, secret)
 
     @staticmethod
     def _find_device(device_path: str | None) -> str:
@@ -446,20 +451,14 @@ class _TKey:
         response[1:] = resp_data
         return bytes(response)
 
-    def _load_app(self, file_path: str, secret: str | None = None) -> None:
-        try:
-            file_size = os.path.getsize(file_path)
-            with open(file_path, "rb") as f:
-                file_data = f.read()
-        except Exception as e:
-            raise TKeyAppError(f"Failed to read application binary {file_path}") from e
-
+    def _load_app(self, app_binary: bytes, secret: str | None = None) -> None:
+        file_size = len(app_binary)
         if file_size > APP_MAXSIZE:
             raise TKeyAppError(
                 f"Application binary is too large ({file_size} > {APP_MAXSIZE})"
             )
 
-        file_digest = hashlib.blake2s(file_data, digest_size=32).digest()
+        file_digest = hashlib.blake2s(app_binary, digest_size=32).digest()
 
         # cmdLoadApp ID 0x03, length index 3 (128 bytes)
         data = bytearray(127)
@@ -473,7 +472,7 @@ class _TKey:
         if response[2] == 1:
             raise TKeyAppError("Device not ready (STATUS_BAD)")
 
-        result_digest = self._load_app_data(file_data)
+        result_digest = self._load_app_data(app_binary)
         if file_digest != result_digest:
             raise TKeyAppError(
                 "Hash digests do not match "
@@ -501,7 +500,7 @@ class _TKey:
 
         return digest
 
-    def _ensure_app_loaded(self, secret: str | None) -> None:
+    def _ensure_app_loaded(self, app: _TKeyApp, secret: str | None) -> None:
         """Load application if needed
 
         Note that if the application is already loaded, we cannot verify that
@@ -514,15 +513,14 @@ class _TKey:
             # application rejected the firmware command, or timed out.
             # Query application name and version
             rx = self.send(Cmd.GET_NAME_VER_APP, 0, Endpoint.APP)
-            name0 = rx[2:6].decode("ascii").rstrip()
-            name1 = rx[6:10].decode("ascii").rstrip()
+            name = (rx[2:6].decode("ascii").rstrip(), rx[6:10].decode("ascii").rstrip())
             ver = int.from_bytes(rx[10:14], byteorder="little")
-            if name0 == "tk1" and name1 == "mlds" and ver == self._version:
+            if name == app.name and ver == app.version:
                 return  # Signer application is already loaded
 
             raise TKeyError(
-                f"TKey is running an unknown application {name0, name1, ver}, "
-                f"expected ('tk1', 'mlds', {self._version})"
+                f"TKey is running an unknown application {name, ver}, "
+                f"expected {app.name, app.version}"
             )
 
         # we are in firmware mode. Load the app
@@ -531,16 +529,10 @@ class _TKey:
         if fw_name0 != "tk1" or fw_name1 != "mkdf":
             raise TKeyError(f"TKey is running an unknown firmware {fw_name0, fw_name1}")
 
-        app_resource = files("securesystemslib.signer.tkey").joinpath(
-            f"app_v{self._version}.bin"
-        )
         try:
-            with as_file(app_resource) as app_path:
-                self._load_app(str(app_path), secret=secret)
+            self._load_app(app.binary, secret=secret)
         except TKeyAppError as e:
-            raise TKeyAppError(
-                f"Failed to load application version {self._version}"
-            ) from e
+            raise TKeyAppError("Failed to load application binary") from e
 
         if self._conn and self._conn.in_waiting:
             self._conn.read(self._conn.in_waiting)
@@ -634,13 +626,16 @@ class TKeySigner(Signer):
         public_key: SSlibKey,
         secrets_handler: SecretsHandler | None = None,
     ) -> None:
+        if PYSERIAL_IMPORT_ERROR:
+            raise UnsupportedLibraryError(PYSERIAL_IMPORT_ERROR)
+
         if public_key.scheme != "ml-dsa-44/1":
             raise ValueError(f"unsupported scheme {public_key.scheme}")
 
         self._public_key = public_key
 
         passphrase = secrets_handler("Passphrase") if secrets_handler else None
-        self._tkey = _TKey(device_path, version, passphrase)
+        self._tkey = _TKey(device_path, self._get_app(version), passphrase)
 
         # key derivation depends on passphrase: compare keys to make sure
         raw_pubkey = self._tkey.get_pubkey()
@@ -649,6 +644,14 @@ class TKeySigner(Signer):
             raise TKeyError(
                 "TKey public key does not match: This could mean incorrect Passphrase."
             )
+
+    @staticmethod
+    def _get_app(version: int) -> _TKeyApp:
+        app_resource = files("securesystemslib.signer.tkey").joinpath(
+            f"app_v{version}.bin"
+        )
+        app_binary = app_resource.read_bytes()
+        return _TKeyApp(app_binary, ("tk1", "mlds"), version)
 
     @property
     def public_key(self) -> SSlibKey:
@@ -710,7 +713,10 @@ class TKeySigner(Signer):
             passphrase: Optional "User Supplied Secret". Will be used as part of the
                 seed for the ML-DSA key
         """
-        with _TKey(device_path, version, passphrase) as tk:
+        if PYSERIAL_IMPORT_ERROR:
+            raise UnsupportedLibraryError(PYSERIAL_IMPORT_ERROR)
+
+        with _TKey(device_path, cls._get_app(version), passphrase) as tk:
             raw_pubkey = tk.get_pubkey()
 
         key = SSlibKey.from_crypto(MLDSA44PublicKey.from_public_bytes(raw_pubkey))

@@ -1,9 +1,8 @@
 import hashlib
 import unittest
-from unittest.mock import ANY, MagicMock, patch
+from unittest.mock import MagicMock, patch
 from urllib import parse
 
-from securesystemslib.exceptions import UnverifiedSignatureError
 from securesystemslib.signer import SSlibKey
 from securesystemslib.signer._tkey_signer import (
     PROTO_DATA_LENGTH,
@@ -14,6 +13,7 @@ from securesystemslib.signer._tkey_signer import (
     TKeyError,
     TKeySigner,
     _TKey,
+    _TKeyApp,
 )
 
 
@@ -73,27 +73,41 @@ class TestTKeySignerOffline(unittest.TestCase):
     @patch("securesystemslib.signer._tkey_signer._TKey")
     @patch("securesystemslib.signer._tkey_signer.MLDSA44PublicKey.from_public_bytes")
     @patch("securesystemslib.signer._tkey_signer.SSlibKey.from_crypto")
+    @patch.object(TKeySigner, "_get_app")
     def test_from_priv_key_uri_parsing(
         self,
+        mock_get_app: MagicMock,
         mock_from_crypto: MagicMock,
         mock_from_public_bytes: MagicMock,
         mock_tkey_class: MagicMock,
     ) -> None:
+        mock_get_app.side_effect = lambda version: _TKeyApp(
+            binary=b"dummy_binary", name=("tk1", "mlds"), version=version
+        )
         mock_key = MagicMock(spec=SSlibKey)
         mock_key.keyval = self.mock_public_key.keyval
         mock_from_crypto.return_value = mock_key
 
         mock_tk_inst = MagicMock()
+        mock_tk_inst.app_version = None
         mock_tk_inst.get_pubkey.return_value = b"dummy_pubkey_bytes"
         mock_tkey_class.return_value = mock_tk_inst
 
         # path and version
-        signer = TKeySigner.from_priv_key_uri("tkey:/dev/ttyACM0?version=5", self.mock_public_key)
-        mock_tkey_class.assert_called_with("/dev/ttyACM0", 5, None)
+        TKeySigner.from_priv_key_uri("tkey:/dev/ttyACM0?version=5", self.mock_public_key)
+        mock_tkey_class.assert_called_with(
+            "/dev/ttyACM0",
+            _TKeyApp(binary=b"dummy_binary", name=("tk1", "mlds"), version=5),
+            None
+        )
 
         # version only
-        signer = TKeySigner.from_priv_key_uri("tkey:?version=12", self.mock_public_key)
-        mock_tkey_class.assert_called_with(None, 12, None)
+        TKeySigner.from_priv_key_uri("tkey:?version=12", self.mock_public_key)
+        mock_tkey_class.assert_called_with(
+            None,
+            _TKeyApp(binary=b"dummy_binary", name=("tk1", "mlds"), version=12),
+            None
+        )
 
         # No version
         with self.assertRaises(ValueError):
@@ -113,24 +127,32 @@ class TestTKeySignerOffline(unittest.TestCase):
 
         # passphrase=true with secrets_handler
         secrets_handler = MagicMock(return_value="mysecret")
-        signer = TKeySigner.from_priv_key_uri(
+        TKeySigner.from_priv_key_uri(
             "tkey:/dev/ttyACM0?version=5&passphrase=true",
             self.mock_public_key,
             secrets_handler,
         )
         secrets_handler.assert_called_once_with("Passphrase")
-        mock_tkey_class.assert_called_with("/dev/ttyACM0", 5, "mysecret")
+        mock_tkey_class.assert_called_with(
+            "/dev/ttyACM0",
+            _TKeyApp(binary=b"dummy_binary", name=("tk1", "mlds"), version=5),
+            "mysecret"
+        )
 
         # passphrase=false
         mock_tkey_class.reset_mock()
         secrets_handler.reset_mock()
-        signer = TKeySigner.from_priv_key_uri(
+        TKeySigner.from_priv_key_uri(
             "tkey:/dev/ttyACM0?version=5&passphrase=false",
             self.mock_public_key,
             secrets_handler,
         )
         secrets_handler.assert_not_called()
-        mock_tkey_class.assert_called_with("/dev/ttyACM0", 5, None)
+        mock_tkey_class.assert_called_with(
+            "/dev/ttyACM0",
+            _TKeyApp(binary=b"dummy_binary", name=("tk1", "mlds"), version=5),
+            None
+        )
 
 
     @patch("securesystemslib.signer._tkey_signer._RawSerialConnection")
@@ -138,14 +160,19 @@ class TestTKeySignerOffline(unittest.TestCase):
     @patch("securesystemslib.signer._tkey_signer.SSlibKey.from_crypto")
     @patch.object(_TKey, "get_pubkey", return_value=b"dummy_pubkey_bytes")
     @patch.object(_TKey, "_find_device", return_value="/dev/ttyACM0")
-    def test_import_with_app_already_loaded(
+    @patch.object(TKeySigner, "_get_app")
+    def test_import_with_app_already_loaded(  # noqa: PLR0913
         self,
+        mock_get_app: MagicMock,
         mock_find_device: MagicMock,
         mock_get_pubkey: MagicMock,
         mock_from_crypto: MagicMock,
         mock_from_public_bytes: MagicMock,
         mock_conn_class: MagicMock,
     ) -> None:
+        mock_get_app.side_effect = lambda version: _TKeyApp(
+            binary=b"dummy_binary", name=("tk1", "mlds"), version=version
+        )
         # Prepare connection mock (needs enough reads for two sequential import calls)
         app_name_payload = b"tk1 " + b"mlds" + (4).to_bytes(4, byteorder="little")
         app_response = make_response_frame(
@@ -181,14 +208,19 @@ class TestTKeySignerOffline(unittest.TestCase):
     @patch("securesystemslib.signer._tkey_signer.SSlibKey.from_crypto")
     @patch.object(_TKey, "_find_device", return_value="/dev/ttyACM0")
     @patch.object(_TKey, "get_pubkey", return_value=b"dummy_pubkey_bytes")
-    def test_import_with_app_loaded_mismatched_version(
+    @patch.object(TKeySigner, "_get_app")
+    def test_import_with_app_loaded_mismatched_version(  # noqa: PLR0913
         self,
+        mock_get_app: MagicMock,
         mock_get_pubkey: MagicMock,
         mock_find_device: MagicMock,
         mock_from_crypto: MagicMock,
         mock_from_public_bytes: MagicMock,
         mock_conn_class: MagicMock,
     ) -> None:
+        mock_get_app.side_effect = lambda version: _TKeyApp(
+            binary=b"dummy_binary", name=("tk1", "mlds"), version=version
+        )
         # Setup serial response: GET_NAME_VER_APP returns version 4
         app_name_payload = b"tk1 " + b"mlds" + (4).to_bytes(4, byteorder="little")
         app_response = make_response_frame(
@@ -212,14 +244,19 @@ class TestTKeySignerOffline(unittest.TestCase):
     @patch("securesystemslib.signer._tkey_signer.SSlibKey.from_crypto")
     @patch.object(_TKey, "_find_device", return_value="/dev/ttyACM0")
     @patch.object(_TKey, "get_pubkey", return_value=b"dummy_pubkey_bytes")
-    def test_import_in_firmware_mode_loads_correct_version(
+    @patch.object(TKeySigner, "_get_app")
+    def test_import_in_firmware_mode_loads_correct_version(  # noqa: PLR0913
         self,
+        mock_get_app: MagicMock,
         mock_get_pubkey: MagicMock,
         mock_find_device: MagicMock,
         mock_from_crypto: MagicMock,
         mock_from_public_bytes: MagicMock,
         mock_conn_class: MagicMock,
     ) -> None:
+        mock_get_app.side_effect = lambda version: _TKeyApp(
+            binary=b"dummy_binary", name=("tk1", "mlds"), version=version
+        )
         # Setup serial response: NAME_VERSION FW command succeeds
         fw_name_payload = b"tk1 " + b"mkdf"
         fw_response = make_response_frame(
@@ -242,24 +279,27 @@ class TestTKeySignerOffline(unittest.TestCase):
             self.assertEqual(uri, "tkey:/dev/ttyACM0?version=5")
             self.assertEqual(key, mock_key)
 
-            # Verify that _load_app was called
-            mock_load_app.assert_called_once()
-            # Verify self.app_resource path ends with app_v5.bin
-            self.assertTrue(mock_load_app.call_args[0][0].endswith("app_v5.bin"))
+            # Verify that _load_app was called with the dummy_binary
+            mock_load_app.assert_called_once_with(b"dummy_binary", secret=None)
 
     @patch("securesystemslib.signer._tkey_signer._RawSerialConnection")
     @patch("securesystemslib.signer._tkey_signer.MLDSA44PublicKey.from_public_bytes")
     @patch("securesystemslib.signer._tkey_signer.SSlibKey.from_crypto")
     @patch.object(_TKey, "_find_device", return_value="/dev/ttyACM0")
     @patch.object(_TKey, "get_pubkey", return_value=b"dummy_pubkey_bytes")
-    def test_import_with_passphrase(
+    @patch.object(TKeySigner, "_get_app")
+    def test_import_with_passphrase(  # noqa: PLR0913
         self,
+        mock_get_app: MagicMock,
         mock_get_pubkey: MagicMock,
         mock_find_device: MagicMock,
         mock_from_crypto: MagicMock,
         mock_from_public_bytes: MagicMock,
         mock_conn_class: MagicMock,
     ) -> None:
+        mock_get_app.side_effect = lambda version: _TKeyApp(
+            binary=b"dummy_binary", name=("tk1", "mlds"), version=version
+        )
         # Setup serial response: NAME_VERSION FW command succeeds
         fw_name_payload = b"tk1 " + b"mkdf"
         fw_response = make_response_frame(
@@ -284,22 +324,16 @@ class TestTKeySignerOffline(unittest.TestCase):
             self.assertEqual(query.get("passphrase"), ["true"])
             self.assertEqual(key, mock_key)
 
-            # Verify that _load_app was called with secret
-            mock_load_app.assert_called_once_with(ANY, secret="mysecret")
+            # Verify that _load_app was called with secret and dummy_binary
+            mock_load_app.assert_called_once_with(b"dummy_binary", secret="mysecret")
 
-    @patch("os.path.getsize")
-    @patch("builtins.open", new_callable=unittest.mock.mock_open, read_data=b"mock_app_data")
     @patch("securesystemslib.signer._tkey_signer._RawSerialConnection")
     @patch.object(_TKey, "_find_device", return_value="/dev/ttyACM0")
     def test_load_app_hashes_secret(
         self,
         mock_find_device: MagicMock,
         mock_conn_class: MagicMock,
-        mock_open: MagicMock,
-        mock_getsize: MagicMock,
     ) -> None:
-        mock_getsize.return_value = len(b"mock_app_data")
-
         # Set up responses for:
         # 1. NAME_VERSION (FW mode check)
         # 2. LOAD_APP
@@ -338,7 +372,8 @@ class TestTKeySignerOffline(unittest.TestCase):
 
         secret = "my_super_secret_passphrase"
         # We instantiate _TKey which should call _ensure_app_loaded -> _load_app
-        tk = _TKey(device=None, version=4, secret=secret)
+        app = _TKeyApp(binary=b"mock_app_data", name=("tk1", "mlds"), version=4)
+        tk = _TKey(device=None, app=app, secret=secret)
         tk.disconnect()
 
         # Now, let's inspect the written data for the LOAD_APP command.
@@ -366,17 +401,23 @@ class TestTKeySignerOffline(unittest.TestCase):
     @patch("securesystemslib.signer._tkey_signer._TKey")
     @patch("securesystemslib.signer._tkey_signer.MLDSA44PublicKey.from_public_bytes")
     @patch("securesystemslib.signer._tkey_signer.SSlibKey.from_crypto")
+    @patch.object(TKeySigner, "_get_app")
     def test_sign_with_passphrase(
         self,
+        mock_get_app: MagicMock,
         mock_from_crypto: MagicMock,
         mock_from_public_bytes: MagicMock,
         mock_tkey_class: MagicMock,
     ) -> None:
+        mock_get_app.side_effect = lambda version: _TKeyApp(
+            binary=b"dummy_binary", name=("tk1", "mlds"), version=version
+        )
         mock_key = MagicMock(spec=SSlibKey)
         mock_key.keyval = self.mock_public_key.keyval
         mock_from_crypto.return_value = mock_key
 
         mock_tk_inst = MagicMock()
+        mock_tk_inst.app_version = None
         mock_tk_inst.get_pubkey.return_value = b"dummy_pubkey_bytes"
         mock_tk_inst.sign.return_value = b"dummy_signature"
         mock_tkey_class.return_value = mock_tk_inst
@@ -395,8 +436,12 @@ class TestTKeySignerOffline(unittest.TestCase):
 
         # secrets_handler should have been called with "uss" during construction
         secrets_handler.assert_called_once_with("Passphrase")
-        # _TKey constructor should have been called with secret "mysecret"
-        mock_tkey_class.assert_called_once_with("/dev/ttyACM0", 4, "mysecret")
+        # _TKey constructor should have been called with secret "mysecret" and expected app
+        mock_tkey_class.assert_called_once_with(
+            "/dev/ttyACM0",
+            _TKeyApp(binary=b"dummy_binary", name=("tk1", "mlds"), version=4),
+            "mysecret"
+        )
 
         # _TKey.sign should have been called with expected tuf formatted message
         digest = hashlib.sha512(b"mypayload").digest()
@@ -406,17 +451,23 @@ class TestTKeySignerOffline(unittest.TestCase):
     @patch("securesystemslib.signer._tkey_signer._TKey")
     @patch("securesystemslib.signer._tkey_signer.MLDSA44PublicKey.from_public_bytes")
     @patch("securesystemslib.signer._tkey_signer.SSlibKey.from_crypto")
+    @patch.object(TKeySigner, "_get_app")
     def test_sign_without_passphrase(
         self,
+        mock_get_app: MagicMock,
         mock_from_crypto: MagicMock,
         mock_from_public_bytes: MagicMock,
         mock_tkey_class: MagicMock,
     ) -> None:
+        mock_get_app.side_effect = lambda version: _TKeyApp(
+            binary=b"dummy_binary", name=("tk1", "mlds"), version=version
+        )
         mock_key = MagicMock(spec=SSlibKey)
         mock_key.keyval = self.mock_public_key.keyval
         mock_from_crypto.return_value = mock_key
 
         mock_tk_inst = MagicMock()
+        mock_tk_inst.app_version = None
         mock_tk_inst.get_pubkey.return_value = b"dummy_pubkey_bytes"
         mock_tk_inst.sign.return_value = b"dummy_signature"
         mock_tkey_class.return_value = mock_tk_inst
@@ -431,24 +482,34 @@ class TestTKeySignerOffline(unittest.TestCase):
         self.assertEqual(signature.keyid, "mock_keyid")
         self.assertEqual(signature.signature, b"dummy_signature".hex())
 
-        # _TKey constructor should have been called with secret=None
-        mock_tkey_class.assert_called_once_with("/dev/ttyACM0", 4, None)
+        # _TKey constructor should have been called with secret=None and expected app
+        mock_tkey_class.assert_called_once_with(
+            "/dev/ttyACM0",
+            _TKeyApp(binary=b"dummy_binary", name=("tk1", "mlds"), version=4),
+            None
+        )
 
     @patch("securesystemslib.signer._tkey_signer._TKey")
     @patch("securesystemslib.signer._tkey_signer.MLDSA44PublicKey.from_public_bytes")
     @patch("securesystemslib.signer._tkey_signer.SSlibKey.from_crypto")
+    @patch.object(TKeySigner, "_get_app")
     def test_init_public_key_mismatch(
         self,
+        mock_get_app: MagicMock,
         mock_from_crypto: MagicMock,
         mock_from_public_bytes: MagicMock,
         mock_tkey_class: MagicMock,
     ) -> None:
+        mock_get_app.side_effect = lambda version: _TKeyApp(
+            binary=b"dummy_binary", name=("tk1", "mlds"), version=version
+        )
         # Mock the derived key to have a mismatched keyval
         mock_derived_key = MagicMock(spec=SSlibKey)
         mock_derived_key.keyval = "mismatched_keyval"
         mock_from_crypto.return_value = mock_derived_key
 
         mock_tk_inst = MagicMock()
+        mock_tk_inst.app_version = None
         mock_tk_inst.get_pubkey.return_value = b"dummy_pubkey_bytes"
         mock_tkey_class.return_value = mock_tk_inst
 
