@@ -43,13 +43,6 @@ TKEY_USB_PID = 0x8887
 # Maximum size for applications to load onto TKey (100 KiB)
 APP_MAXSIZE = 100 * 1024
 
-# Protocol chunking
-CHUNK_SIZE = 120
-SIG_SIZE = 2420
-KEY_SIZE = 1312
-SIG_CHUNKS = SIG_SIZE // CHUNK_SIZE
-KEY_CHUNKS = KEY_SIZE // CHUNK_SIZE
-
 
 class TKeyError(Error):
     """Base class for TKey errors."""
@@ -84,33 +77,17 @@ class Endpoint:
     APP = 3
 
 
-class Cmd:
-    # FW commands:
+class FwCmd:
     NAME_VERSION = 0x01
     LOAD_APP = 0x03
     LOAD_APP_DATA = 0x05
-    # App commands:
-    SET_SIZE = 0x03
-    SIGN_DATA = 0x05
-    GET_SIG = 0x07
-    GET_KEY_CHUNK = 0x11
-    GET_SIG_CHUNK = 0x13
-    GET_NAME_VER_APP = 0x09
 
 
-class Rsp:
-    # FW Responses:
+class FwRsp:
     NAME_VERSION = 0x02
     LOAD_APP = 0x04
     LOAD_APP_DATA = 0x06
     LOAD_APP_DATA_READY = 0x07
-    # App Responses:
-    SET_SIZE = 0x04
-    SIGN_DATA = 0x06
-    GET_SIG = 0x08
-    GET_KEY_CHUNK = 0x12
-    GET_SIG_CHUNK = 0x14
-    GET_NAME_VER_APP = 0x0A
 
 
 # Data lengths corresponding to header length bits (0, 1, 2, 3)
@@ -248,28 +225,21 @@ class _RawSerialConnection:
             self._fd = None
 
 
-@dataclass
-class _TKeyApp:
-    binary: bytes
-    name: tuple[str, str]
-    version: int
+class _TKeyBase:
+    """Base TKey Client
 
-
-class _TKey:
-    """Client for a TKey ML-DSA signer application"""
+    _TKeyBase handles serial IO, provides load_app() for loading an application.
+    """
 
     def __init__(
         self,
         device: str | None,
-        app: _TKeyApp,
-        secret: str | None,
     ) -> None:
 
         self._conn: _SerialConnection | None = None
         self._fid = 0
 
         self._connect(device, baudrate=62500, timeout=5.0)
-        self._ensure_app_loaded(app, secret)
 
     @staticmethod
     def _find_device(device_path: str | None) -> str:
@@ -307,7 +277,7 @@ class _TKey:
                 logger.debug("Failed to close TKey connection: %s", e)
             self._conn = None
 
-    def __enter__(self) -> _TKey:
+    def __enter__(self) -> _TKeyBase:
         return self
 
     def __exit__(
@@ -322,41 +292,6 @@ class _TKey:
         """Returns a frame id (rotating sequence [0-3])"""
         self._fid = (self._fid + 1) % 4
         return self._fid
-
-    @staticmethod
-    def _validate_response(
-        eid: int, cmd_id: int, resp_id: int, resp_len_idx: int
-    ) -> None:
-        """Validate response ID and length index matches expected response."""
-        match (eid, cmd_id, resp_id, resp_len_idx):
-            # Firmware Commands
-            case (Endpoint.FW, Cmd.NAME_VERSION, Rsp.NAME_VERSION, LenIdx.I32):
-                pass
-            case (Endpoint.FW, Cmd.LOAD_APP, Rsp.LOAD_APP, LenIdx.I4):
-                pass
-            case (Endpoint.FW, Cmd.LOAD_APP_DATA, Rsp.LOAD_APP_DATA, LenIdx.I4):
-                pass
-            case (Endpoint.FW, Cmd.LOAD_APP_DATA, Rsp.LOAD_APP_DATA_READY, LenIdx.I128):
-                pass
-
-            # Application Commands
-            case (Endpoint.APP, Cmd.GET_KEY_CHUNK, Rsp.GET_KEY_CHUNK, LenIdx.I128):
-                pass
-            case (Endpoint.APP, Cmd.SET_SIZE, Rsp.SET_SIZE, LenIdx.I4):
-                pass
-            case (Endpoint.APP, Cmd.SIGN_DATA, Rsp.SIGN_DATA, LenIdx.I4):
-                pass
-            case (Endpoint.APP, Cmd.GET_SIG, Rsp.GET_SIG, LenIdx.I128):
-                pass
-            case (Endpoint.APP, Cmd.GET_SIG_CHUNK, Rsp.GET_SIG_CHUNK, LenIdx.I128):
-                pass
-            case (Endpoint.APP, Cmd.GET_NAME_VER_APP, Rsp.GET_NAME_VER_APP, LenIdx.I32):
-                pass
-            case _:
-                raise TKeyProtocolError(
-                    f"Unexpected protocol response: endpoint={eid:#x}, cmd={cmd_id:#x},"
-                    f" response={resp_id:#x}, len_index={resp_len_idx}"
-                )
 
     def send(
         self,
@@ -444,19 +379,61 @@ class _TKey:
                 f"got Frame ID {resp_fid} and Endpoint {resp_eid}"
             )
 
-        self._validate_response(resp_eid, cmd_id, resp_data[0], resp_len_idx)
+        self.validate_response(resp_eid, cmd_id, resp_data[0], resp_len_idx)
 
         response = bytearray(1 + resp_len)
         response[0] = header_val
         response[1:] = resp_data
         return bytes(response)
 
-    def _load_app(self, app_binary: bytes, secret: str | None = None) -> None:
+    def validate_response(
+        self, eid: int, cmd_id: int, resp_id: int, resp_len_idx: int
+    ) -> None:
+        raise NotImplementedError  # should be overriden
+
+    def validate_firmware_response(
+        self, cmd_id: int, resp_id: int, resp_len_idx: int
+    ) -> None:
+        """Validate firmware response ID and length index matches expected response."""
+        match (cmd_id, resp_id, resp_len_idx):
+            case (FwCmd.NAME_VERSION, FwRsp.NAME_VERSION, LenIdx.I32):
+                pass
+            case (FwCmd.LOAD_APP, FwRsp.LOAD_APP, LenIdx.I4):
+                pass
+            case (FwCmd.LOAD_APP_DATA, FwRsp.LOAD_APP_DATA, LenIdx.I4):
+                pass
+            case (FwCmd.LOAD_APP_DATA, FwRsp.LOAD_APP_DATA_READY, LenIdx.I128):
+                pass
+            case (_, _, _):
+                raise TKeyProtocolError(
+                    f"Unexpected firmware protocol response: cmd={cmd_id:#x},"
+                    f" response={resp_id:#x}, len_index={resp_len_idx}"
+                )
+
+    def load_app(self, app_binary: bytes, secret: str | None = None) -> bool:
+        """
+        Returns True if the application as loaded, False if the device is not
+        in Firmware mode
+        """
         file_size = len(app_binary)
         if file_size > APP_MAXSIZE:
             raise TKeyAppError(
                 f"Application binary is too large ({file_size} > {APP_MAXSIZE})"
             )
+
+        try:
+            # Query firmware name
+            rx = self.send(FwCmd.NAME_VERSION, 0, Endpoint.FW)
+        except TKeyError as e:
+            # Not in firmware mode
+            # TODO would be nice to only do this on NOK response, not other errors
+            return False
+
+        # we are in firmware mode. Load the app
+        fw_name0 = rx[2:6].decode("ascii").rstrip()
+        fw_name1 = rx[6:10].decode("ascii").rstrip()
+        if fw_name0 != "tk1" or fw_name1 != "mkdf":
+            raise TKeyError(f"TKey is running an unknown firmware {fw_name0, fw_name1}")
 
         file_digest = hashlib.blake2s(app_binary, digest_size=32).digest()
 
@@ -468,16 +445,21 @@ class _TKey:
             uss = hashlib.blake2s(secret.encode("utf-8"), digest_size=32)
             data[5 : 5 + 32] = uss.digest()
 
-        response = self.send(Cmd.LOAD_APP, 3, Endpoint.FW, bytes(data))
+        response = self.send(FwCmd.LOAD_APP, 3, Endpoint.FW, bytes(data))
         if response[2] == 1:
             raise TKeyAppError("Device not ready (STATUS_BAD)")
 
         result_digest = self._load_app_data(app_binary)
         if file_digest != result_digest:
             raise TKeyAppError(
-                "Hash digests do not match "
+                "App digest does not match "
                 f"({file_digest.hex()} != {result_digest.hex()})"
             )
+
+        if self._conn and self._conn.in_waiting:
+            self._conn.read(self._conn.in_waiting)
+
+        return True
 
     def _load_app_data(self, file_data: bytes) -> bytes:
         # cmdLoadAppData ID 0x05, length index 3 (128 bytes)
@@ -485,34 +467,72 @@ class _TKey:
         offset = 0
         while offset < len(file_data):
             chunk = file_data[offset : offset + 127]
-            response = self.send(Cmd.LOAD_APP_DATA, 3, Endpoint.FW, chunk)
+            response = self.send(FwCmd.LOAD_APP_DATA, 3, Endpoint.FW, chunk)
             response_id = response[1]
             status = response[2]
             if status == 1:
                 raise TKeyError("Bad status when writing app data")
 
-            if response_id == Rsp.LOAD_APP_DATA_READY:
+            if response_id == FwRsp.LOAD_APP_DATA_READY:
                 digest = response[3:35]
-            elif response_id != Rsp.LOAD_APP_DATA:
+            elif response_id != FwRsp.LOAD_APP_DATA:
                 raise TKeyProtocolError(f"Unexpected response code {response_id}")
 
             offset += 127
 
         return digest
 
-    def _ensure_app_loaded(self, app: _TKeyApp, secret: str | None) -> None:
-        """Load application if needed
 
-        Note that if the application is already loaded, we cannot verify that
-        it was loaded with the same secret.
-        """
-        try:
-            # Query firmware name
-            rx = self.send(Cmd.NAME_VERSION, 0, Endpoint.FW)
-        except TKeyError:
-            # application rejected the firmware command, or timed out.
-            # Query application name and version
-            rx = self.send(Cmd.GET_NAME_VER_APP, 0, Endpoint.APP)
+@dataclass
+class MldsaAppData:
+    binary: bytes
+    name: tuple[str, str]
+    version: int
+
+
+class MldsaCmd:
+    SET_SIZE = 0x03
+    SIGN_DATA = 0x05
+    GET_SIG = 0x07
+    GET_KEY_CHUNK = 0x11
+    GET_SIG_CHUNK = 0x13
+    GET_NAME_VER_APP = 0x09
+
+
+class MldsaRsp:
+    SET_SIZE = 0x04
+    SIGN_DATA = 0x06
+    GET_SIG = 0x08
+    GET_KEY_CHUNK = 0x12
+    GET_SIG_CHUNK = 0x14
+    GET_NAME_VER_APP = 0x0A
+
+
+# Maximum size for data to sign
+MAX_SIGN_SIZE = 4096
+
+# Protocol chunking
+CHUNK_SIZE = 120
+SIG_SIZE = 2420
+KEY_SIZE = 1312
+SIG_CHUNKS = SIG_SIZE // CHUNK_SIZE
+KEY_CHUNKS = KEY_SIZE // CHUNK_SIZE
+
+
+class _TKeyMldsa(_TKeyBase):
+    """Client for a TKey ML-DSA signer application"""
+
+    def __init__(
+        self,
+        device: str | None,
+        app: MldsaAppData,
+        secret: str | None,
+    ) -> None:
+        super().__init__(device)
+
+        if not self.load_app(app.binary, secret):
+            # TKey is not in firmware mode: Query application name and version
+            rx = self.send(MldsaCmd.GET_NAME_VER_APP, 0, Endpoint.APP)
             name = (rx[2:6].decode("ascii").rstrip(), rx[6:10].decode("ascii").rstrip())
             ver = int.from_bytes(rx[10:14], byteorder="little")
             if name == app.name and ver == app.version:
@@ -523,19 +543,42 @@ class _TKey:
                 f"expected {app.name, app.version}"
             )
 
-        # we are in firmware mode. Load the app
-        fw_name0 = rx[2:6].decode("ascii").rstrip()
-        fw_name1 = rx[6:10].decode("ascii").rstrip()
-        if fw_name0 != "tk1" or fw_name1 != "mkdf":
-            raise TKeyError(f"TKey is running an unknown firmware {fw_name0, fw_name1}")
 
-        try:
-            self._load_app(app.binary, secret=secret)
-        except TKeyAppError as e:
-            raise TKeyAppError("Failed to load application binary") from e
+    def validate_response(
+        self, eid: int, cmd_id: int, resp_id: int, resp_len_idx: int
+    ) -> None:
+        """Validate response ID and length index matches expected response."""
 
-        if self._conn and self._conn.in_waiting:
-            self._conn.read(self._conn.in_waiting)
+        match eid:
+            case Endpoint.FW:
+                self.validate_firmware_response(cmd_id, resp_id, resp_len_idx)
+            case Endpoint.APP:
+                self.validate_app_response(cmd_id, resp_id, resp_len_idx)
+            case _:
+                raise TKeyProtocolError(f"Unexpected endpoint={eid:#x}")
+
+    def validate_app_response(
+        self, cmd_id: int, resp_id: int, resp_len_idx: int
+    ) -> None:
+        match (cmd_id, resp_id, resp_len_idx):
+            case (MldsaCmd.GET_KEY_CHUNK, MldsaRsp.GET_KEY_CHUNK, LenIdx.I128):
+                pass
+            case (MldsaCmd.SET_SIZE, MldsaRsp.SET_SIZE, LenIdx.I4):
+                pass
+            case (MldsaCmd.SIGN_DATA, MldsaRsp.SIGN_DATA, LenIdx.I4):
+                pass
+            case (MldsaCmd.GET_SIG, MldsaRsp.GET_SIG, LenIdx.I128):
+                pass
+            case (MldsaCmd.GET_SIG_CHUNK, MldsaRsp.GET_SIG_CHUNK, LenIdx.I128):
+                pass
+            case (MldsaCmd.GET_NAME_VER_APP, MldsaRsp.GET_NAME_VER_APP, LenIdx.I32):
+                pass
+            case (_, _, _):
+                raise TKeyProtocolError(
+                    f"Unexpected application protocol response: cmd={cmd_id:#x},"
+                    f" response={resp_id:#x}, len_index={resp_len_idx}"
+                )
+
 
     def get_pubkey(self) -> bytes:
         """Retrieve 1312-byte ML-DSA-44 public key from device in 120-byte chunks."""
@@ -543,7 +586,7 @@ class _TKey:
         for i in range(KEY_CHUNKS + 1):
             tx_data = bytes([i, 0, 0])  # 1 byte chunk index + 2 bytes padding
             # CMD_GET_KEY_CHUNK ID 0x11, length index 1 (4 bytes)
-            rx = self.send(Cmd.GET_KEY_CHUNK, 1, Endpoint.APP, tx_data)
+            rx = self.send(MldsaCmd.GET_KEY_CHUNK, 1, Endpoint.APP, tx_data)
 
             if rx[2] != 0:
                 raise TKeyError(f"GetPubkeyChunk NOK status: {rx[2]}")
@@ -561,23 +604,27 @@ class _TKey:
         """Send payload to TKey and fetch 2420-byte signature."""
         # 1. Set size
         size = len(formatted_msg)
+        if size > MAX_SIGN_SIZE:
+            raise ValueError(
+                f"Message size {size} exceeds maximum allowed size {MAX_SIGN_SIZE}"
+            )
         size_bytes = size.to_bytes(4, byteorder="little")
         tx_data = bytearray(31)
         tx_data[0:4] = size_bytes
         # CMD_SET_SIZE ID 0x03, length index 2 (32 bytes)
-        self.send(Cmd.SET_SIZE, 2, Endpoint.APP, bytes(tx_data))
+        self.send(MldsaCmd.SET_SIZE, 2, Endpoint.APP, bytes(tx_data))
 
         # 2. Load data
         offset = 0
         while offset < len(formatted_msg):
             chunk = formatted_msg[offset : offset + 127]
             # CMD_SIGN_DATA ID 0x05, length index 3 (128 bytes)
-            self.send(Cmd.SIGN_DATA, 3, Endpoint.APP, chunk)
+            self.send(MldsaCmd.SIGN_DATA, 3, Endpoint.APP, chunk)
             offset += 127
 
         # 3. Trigger signing (blocks waiting for physical touch)
         # CMD_GET_SIG ID 0x07, length index 0 (1 byte)
-        rx = self.send(Cmd.GET_SIG, 0, Endpoint.APP, timeout=60)
+        rx = self.send(MldsaCmd.GET_SIG, 0, Endpoint.APP, timeout=60)
 
         if rx[2] != 0x00:
             raise TKeyError(f"Response NOK status: hex={rx.hex()}")
@@ -586,7 +633,7 @@ class _TKey:
         signature = bytearray(SIG_SIZE)
         for i in range(SIG_CHUNKS + 1):
             # CMD_GET_SIG_CHUNK ID 0x13, length index 1 (4 bytes)
-            rx = self.send(Cmd.GET_SIG_CHUNK, 1, Endpoint.APP, bytes([i, 0, 0]))
+            rx = self.send(MldsaCmd.GET_SIG_CHUNK, 1, Endpoint.APP, bytes([i, 0, 0]))
             if rx[2] != 0:
                 raise TKeyError(f"GetSigChunk NOK status: {rx[2]}")
             if rx[3] != i:
@@ -635,7 +682,7 @@ class TKeySigner(Signer):
         self._public_key = public_key
 
         passphrase = secrets_handler("Passphrase") if secrets_handler else None
-        self._tkey = _TKey(device_path, self._get_app(version), passphrase)
+        self._tkey = _TKeyMldsa(device_path, self._get_app(version), passphrase)
 
         # key derivation depends on passphrase: compare keys to make sure
         raw_pubkey = self._tkey.get_pubkey()
@@ -646,12 +693,12 @@ class TKeySigner(Signer):
             )
 
     @staticmethod
-    def _get_app(version: int) -> _TKeyApp:
+    def _get_app(version: int) -> MldsaAppData:
         app_resource = files("securesystemslib.signer.tkey").joinpath(
             f"app_v{version}.bin"
         )
         app_binary = app_resource.read_bytes()
-        return _TKeyApp(app_binary, ("tk1", "mlds"), version)
+        return MldsaAppData(app_binary, ("tk1", "mlds"), version)
 
     @property
     def public_key(self) -> SSlibKey:
@@ -716,7 +763,7 @@ class TKeySigner(Signer):
         if PYSERIAL_IMPORT_ERROR:
             raise UnsupportedLibraryError(PYSERIAL_IMPORT_ERROR)
 
-        with _TKey(device_path, cls._get_app(version), passphrase) as tk:
+        with _TKeyMldsa(device_path, cls._get_app(version), passphrase) as tk:
             raw_pubkey = tk.get_pubkey()
 
         key = SSlibKey.from_crypto(MLDSA44PublicKey.from_public_bytes(raw_pubkey))
