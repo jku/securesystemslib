@@ -36,6 +36,9 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+
+#### TKey device support
+
 # USB Vendor & Product ID for TKey
 TKEY_USB_VID = 0x1207
 TKEY_USB_PID = 0x8887
@@ -483,6 +486,9 @@ class _TKeyBase:
         return digest
 
 
+#### TKey ML-DSA signer implementation
+
+
 @dataclass
 class MldsaAppData:
     binary: bytes
@@ -543,7 +549,6 @@ class _TKeyMldsa(_TKeyBase):
                 f"expected {app.name, app.version}"
             )
 
-
     def validate_response(
         self, eid: int, cmd_id: int, resp_id: int, resp_len_idx: int
     ) -> None:
@@ -578,7 +583,6 @@ class _TKeyMldsa(_TKeyBase):
                     f"Unexpected application protocol response: cmd={cmd_id:#x},"
                     f" response={resp_id:#x}, len_index={resp_len_idx}"
                 )
-
 
     def get_pubkey(self) -> bytes:
         """Retrieve 1312-byte ML-DSA-44 public key from device in 120-byte chunks."""
@@ -646,6 +650,9 @@ class _TKeyMldsa(_TKeyBase):
             signature[offset : offset + size] = rx[4 : 4 + size]
 
         return bytes(signature)
+
+
+#### ML-DSA securesystemslib signer implementation
 
 
 class TKeySigner(Signer):
