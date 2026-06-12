@@ -1,6 +1,6 @@
 import unittest
 
-from securesystemslib.signer import Signer, SSlibKey, TKeySigner
+from securesystemslib.signer import Signer, TKeySigner
 
 
 class TestTKeySigner(unittest.TestCase):
