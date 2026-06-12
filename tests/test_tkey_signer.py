@@ -5,33 +5,34 @@ from urllib import parse
 
 from securesystemslib.signer import SSlibKey, TKeySigner
 from securesystemslib.signer._tkey.tkey import (
-    ENDPOINT_FW,
     PROTO_DATA_LENGTH,
     FwCmd,
     FwRsp,
     LenIdx,
     TKey,
     TKeyError,
+    Rsp,
 )
 from securesystemslib.signer._tkey.tkey_mldsa import (
-    ENDPOINT_MLDSA,
     MldsaRsp,
     TKeyMldsa,
 )
+
+ENDPOINT_FW = 2
+ENDPOINT_APP = 3
 
 
 def make_response_frame(  # noqa: PLR0913
     fid: int,
     eid: int,
     status: int,
-    len_idx: int,
-    resp_id: int,
+    rsp: Rsp,
     data: bytes = b"",
 ) -> bytes:
-    header = (fid << 5) | (eid << 3) | (status << 2) | len_idx
-    resp_len = PROTO_DATA_LENGTH[len_idx]
+    header = (fid << 5) | (eid << 3) | (status << 2) | rsp.len_idx
+    resp_len = PROTO_DATA_LENGTH[rsp.len_idx]
     resp_data = bytearray(resp_len)
-    resp_data[0] = resp_id
+    resp_data[0] = rsp.id
     if data:
         resp_data[1 : 1 + len(data)] = data
     return bytes([header]) + bytes(resp_data)
@@ -163,10 +164,9 @@ class TestTKeySignerOffline(unittest.TestCase):
         app_name_payload = b"tk1 " + b"mlds" + (4).to_bytes(4, byteorder="little")
         app_response = make_response_frame(
             fid=2,
-            eid=ENDPOINT_MLDSA,
+            eid=ENDPOINT_APP,
             status=0,
-            len_idx=LenIdx.I32,
-            resp_id=MldsaRsp.GET_NAME_VER_APP,
+            rsp=MldsaRsp.GET_NAME_VER_APP,
             data=app_name_payload,
         )
         mock_conn = MockStreamConnection(reads=[b"", app_response, b"", app_response])
@@ -211,10 +211,9 @@ class TestTKeySignerOffline(unittest.TestCase):
         app_name_payload = b"tk1 " + b"mlds" + (4).to_bytes(4, byteorder="little")
         app_response = make_response_frame(
             fid=2,
-            eid=ENDPOINT_MLDSA,
+            eid=ENDPOINT_APP,
             status=0,
-            len_idx=LenIdx.I32,
-            resp_id=MldsaRsp.GET_NAME_VER_APP,
+            rsp=MldsaRsp.GET_NAME_VER_APP,
             data=app_name_payload,
         )
         mock_conn = MockStreamConnection(reads=[b"", app_response])
@@ -247,8 +246,7 @@ class TestTKeySignerOffline(unittest.TestCase):
             fid=1,
             eid=ENDPOINT_FW,
             status=0,
-            len_idx=LenIdx.I32,
-            resp_id=FwRsp.NAME_VERSION,
+            rsp=FwRsp.NAME_VERSION,
             data=fw_name_payload,
         )
         mock_conn = MockStreamConnection(reads=[fw_response])
@@ -288,8 +286,7 @@ class TestTKeySignerOffline(unittest.TestCase):
             fid=1,
             eid=ENDPOINT_FW,
             status=0,
-            len_idx=LenIdx.I32,
-            resp_id=FwRsp.NAME_VERSION,
+            rsp=FwRsp.NAME_VERSION,
             data=fw_name_payload,
         )
         mock_conn = MockStreamConnection(reads=[fw_response])
@@ -327,8 +324,7 @@ class TestTKeySignerOffline(unittest.TestCase):
             fid=1,
             eid=ENDPOINT_FW,
             status=0,
-            len_idx=LenIdx.I32,
-            resp_id=FwRsp.NAME_VERSION,
+            rsp=FwRsp.NAME_VERSION,
             data=fw_name_payload,
         )
 
@@ -336,8 +332,7 @@ class TestTKeySignerOffline(unittest.TestCase):
             fid=2,
             eid=ENDPOINT_FW,
             status=0,
-            len_idx=LenIdx.I4,
-            resp_id=FwRsp.LOAD_APP,
+            rsp=FwRsp.LOAD_APP,
             data=b"\x00",
         )
 
@@ -346,8 +341,7 @@ class TestTKeySignerOffline(unittest.TestCase):
             fid=3,
             eid=ENDPOINT_FW,
             status=0,
-            len_idx=LenIdx.I128,
-            resp_id=FwRsp.LOAD_APP_DATA_READY,
+            rsp=FwRsp.LOAD_APP_DATA_READY,
             data=b"\x00" + file_digest,
         )
 
@@ -373,7 +367,7 @@ class TestTKeySignerOffline(unittest.TestCase):
         load_app_frame = written_bytes[2 : 2 + 129]
 
         self.assertEqual(load_app_frame[0], 0x53)
-        self.assertEqual(load_app_frame[1], FwCmd.LOAD_APP)
+        self.assertEqual(load_app_frame[1], FwCmd.LOAD_APP.id)
 
         # Let's check the data payload.
         expected_hashed_secret = hashlib.blake2s(

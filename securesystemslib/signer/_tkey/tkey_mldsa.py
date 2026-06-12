@@ -9,36 +9,35 @@ from __future__ import annotations
 import logging
 
 from securesystemslib.signer._tkey.tkey import (
-    ENDPOINT_FW,
+    Cmd,
     LenIdx,
+    Rsp,
     TKey,
     TKeyError,
-    TKeyProtocolError,
 )
 
 logger = logging.getLogger(__name__)
 
-ENDPOINT_MLDSA = 3
-NAME_MLDSA = ("tk1", "mlds")
+
+class MldsaRsp:
+    SET_SIZE = Rsp(0x04, LenIdx.I4)
+    SIGN_DATA = Rsp(0x06, LenIdx.I4)
+    GET_SIG = Rsp(0x08, LenIdx.I128)
+    GET_KEY_CHUNK = Rsp(0x12, LenIdx.I128)
+    GET_SIG_CHUNK = Rsp(0x14, LenIdx.I128)
+    GET_NAME_VER_APP = Rsp(0x0A, LenIdx.I32)
 
 
 class MldsaCmd:
-    SET_SIZE = 0x03
-    SIGN_DATA = 0x05
-    GET_SIG = 0x07
-    GET_KEY_CHUNK = 0x11
-    GET_SIG_CHUNK = 0x13
-    GET_NAME_VER_APP = 0x09
+    SET_SIZE = Cmd(0x03, 3, LenIdx.I32, (MldsaRsp.SET_SIZE,))
+    SIGN_DATA = Cmd(0x05, 3, LenIdx.I128, (MldsaRsp.SIGN_DATA,))
+    GET_SIG = Cmd(0x07, 3, LenIdx.I1, (MldsaRsp.GET_SIG,))
+    GET_KEY_CHUNK = Cmd(0x11, 3, LenIdx.I4, (MldsaRsp.GET_KEY_CHUNK,))
+    GET_SIG_CHUNK = Cmd(0x13, 3, LenIdx.I4, (MldsaRsp.GET_SIG_CHUNK,))
+    GET_NAME_VER_APP = Cmd(0x09, 3, LenIdx.I1, (MldsaRsp.GET_NAME_VER_APP,))
 
 
-class MldsaRsp:
-    SET_SIZE = 0x04
-    SIGN_DATA = 0x06
-    GET_SIG = 0x08
-    GET_KEY_CHUNK = 0x12
-    GET_SIG_CHUNK = 0x14
-    GET_NAME_VER_APP = 0x0A
-
+NAME_MLDSA = ("tk1", "mlds")
 
 # Maximum size for data to sign
 MAX_SIGN_SIZE = 4096
@@ -65,7 +64,7 @@ class TKeyMldsa(TKey):
 
         if not self.load_app(binary, secret):
             # TKey is not in firmware mode: Query application name and version
-            rx = self.send(MldsaCmd.GET_NAME_VER_APP, 0, ENDPOINT_MLDSA)
+            rx = self.send(MldsaCmd.GET_NAME_VER_APP)
             name = (rx[2:6].decode("ascii").rstrip(), rx[6:10].decode("ascii").rstrip())
             ver = int.from_bytes(rx[10:14], byteorder="little")
             if name == NAME_MLDSA and ver == version:
@@ -76,47 +75,11 @@ class TKeyMldsa(TKey):
                 f"expected {NAME_MLDSA, version}"
             )
 
-    def validate_response(
-        self, eid: int, cmd_id: int, resp_id: int, resp_len_idx: int
-    ) -> None:
-        """Validate response ID and length index matches expected response."""
-
-        if eid == ENDPOINT_FW:
-            self.validate_firmware_response(cmd_id, resp_id, resp_len_idx)
-        elif eid == ENDPOINT_MLDSA:
-            self.validate_app_response(cmd_id, resp_id, resp_len_idx)
-        else:
-            raise TKeyProtocolError(f"Unexpected endpoint={eid:#x}")
-
-    def validate_app_response(
-        self, cmd_id: int, resp_id: int, resp_len_idx: int
-    ) -> None:
-        match (cmd_id, resp_id, resp_len_idx):
-            case (MldsaCmd.GET_KEY_CHUNK, MldsaRsp.GET_KEY_CHUNK, LenIdx.I128):
-                pass
-            case (MldsaCmd.SET_SIZE, MldsaRsp.SET_SIZE, LenIdx.I4):
-                pass
-            case (MldsaCmd.SIGN_DATA, MldsaRsp.SIGN_DATA, LenIdx.I4):
-                pass
-            case (MldsaCmd.GET_SIG, MldsaRsp.GET_SIG, LenIdx.I128):
-                pass
-            case (MldsaCmd.GET_SIG_CHUNK, MldsaRsp.GET_SIG_CHUNK, LenIdx.I128):
-                pass
-            case (MldsaCmd.GET_NAME_VER_APP, MldsaRsp.GET_NAME_VER_APP, LenIdx.I32):
-                pass
-            case (_, _, _):
-                raise TKeyProtocolError(
-                    f"Unexpected application protocol response: cmd={cmd_id:#x},"
-                    f" response={resp_id:#x}, len_index={resp_len_idx}"
-                )
-
     def get_pubkey(self) -> bytes:
         """Retrieve 1312-byte ML-DSA-44 public key from device in 120-byte chunks."""
         pubkey = bytearray(KEY_SIZE)
         for i in range(KEY_CHUNKS + 1):
-            tx_data = bytes([i, 0, 0])  # 1 byte chunk index + 2 bytes padding
-            # CMD_GET_KEY_CHUNK ID 0x11, length index 1 (4 bytes)
-            rx = self.send(MldsaCmd.GET_KEY_CHUNK, 1, ENDPOINT_MLDSA, tx_data)
+            rx = self.send(MldsaCmd.GET_KEY_CHUNK, bytes([i, 0, 0]))
 
             if rx[2] != 0:
                 raise TKeyError(f"GetPubkeyChunk NOK status: {rx[2]}")
@@ -141,20 +104,16 @@ class TKeyMldsa(TKey):
         size_bytes = size.to_bytes(4, byteorder="little")
         tx_data = bytearray(31)
         tx_data[0:4] = size_bytes
-        # CMD_SET_SIZE ID 0x03, length index 2 (32 bytes)
-        self.send(MldsaCmd.SET_SIZE, 2, ENDPOINT_MLDSA, bytes(tx_data))
+        self.send(MldsaCmd.SET_SIZE, bytes(tx_data))
 
         # 2. Load data
         offset = 0
         while offset < len(formatted_msg):
-            chunk = formatted_msg[offset : offset + 127]
-            # CMD_SIGN_DATA ID 0x05, length index 3 (128 bytes)
-            self.send(MldsaCmd.SIGN_DATA, 3, ENDPOINT_MLDSA, chunk)
+            self.send(MldsaCmd.SIGN_DATA, formatted_msg[offset : offset + 127])
             offset += 127
 
         # 3. Trigger signing (blocks waiting for physical touch)
-        # CMD_GET_SIG ID 0x07, length index 0 (1 byte)
-        rx = self.send(MldsaCmd.GET_SIG, 0, ENDPOINT_MLDSA, timeout=60)
+        rx = self.send(MldsaCmd.GET_SIG, timeout=60)
 
         if rx[2] != 0x00:
             raise TKeyError(f"Response NOK status: hex={rx.hex()}")
@@ -162,8 +121,7 @@ class TKeyMldsa(TKey):
         # 4. Fetch signature chunks (21 chunks)
         signature = bytearray(SIG_SIZE)
         for i in range(SIG_CHUNKS + 1):
-            # CMD_GET_SIG_CHUNK ID 0x13, length index 1 (4 bytes)
-            rx = self.send(MldsaCmd.GET_SIG_CHUNK, 1, ENDPOINT_MLDSA, bytes([i, 0, 0]))
+            rx = self.send(MldsaCmd.GET_SIG_CHUNK, bytes([i, 0, 0]))
             if rx[2] != 0:
                 raise TKeyError(f"GetSigChunk NOK status: {rx[2]}")
             if rx[3] != i:

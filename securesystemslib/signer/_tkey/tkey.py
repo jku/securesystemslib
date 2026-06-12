@@ -15,7 +15,7 @@ import logging
 import os
 import select
 import sys
-from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from types import TracebackType
 from typing import Protocol, TypeVar
 
@@ -37,21 +37,6 @@ TKEY_USB_PID = 0x8887
 # Maximum size for applications to load onto TKey (100 KiB)
 APP_MAXSIZE = 100 * 1024
 
-ENDPOINT_FW = 2
-
-
-class FwCmd:
-    NAME_VERSION = 0x01
-    LOAD_APP = 0x03
-    LOAD_APP_DATA = 0x05
-
-
-class FwRsp:
-    NAME_VERSION = 0x02
-    LOAD_APP = 0x04
-    LOAD_APP_DATA = 0x06
-    LOAD_APP_DATA_READY = 0x07
-
 
 # Data lengths corresponding to header length bits (0, 1, 2, 3)
 PROTO_DATA_LENGTH = [1, 4, 32, 128]
@@ -63,6 +48,35 @@ class LenIdx:
     I4 = 1
     I32 = 2
     I128 = 3
+
+
+@dataclass(frozen=True)
+class Rsp:
+    id: int
+    len_idx: int
+
+
+@dataclass(frozen=True)
+class Cmd:
+    id: int
+    endpoint: int
+    len_idx: int
+    valid_responses: tuple[Rsp, ...]
+
+
+class FwRsp:
+    NAME_VERSION = Rsp(0x02, LenIdx.I32)
+    LOAD_APP = Rsp(0x04, LenIdx.I4)
+    LOAD_APP_DATA = Rsp(0x06, LenIdx.I4)
+    LOAD_APP_DATA_READY = Rsp(0x07, LenIdx.I128)
+
+
+class FwCmd:
+    NAME_VERSION = Cmd(0x01, 2, LenIdx.I1, (FwRsp.NAME_VERSION,))
+    LOAD_APP = Cmd(0x03, 2, LenIdx.I128, (FwRsp.LOAD_APP,))
+    LOAD_APP_DATA = Cmd(
+        0x05, 2, LenIdx.I128, (FwRsp.LOAD_APP_DATA, FwRsp.LOAD_APP_DATA_READY)
+    )
 
 
 _TKey = TypeVar("_TKey", bound="TKey")
@@ -218,10 +232,10 @@ class _RawSerialConnection:
             self._fd = None
 
 
-class TKey(ABC):
+class TKey:
     """Base TKey Client
 
-    TKey handles serial IO, provides load_app() for loading an application.
+    TKey handles serial IO with send() and application loading with load_app().
 
     """
 
@@ -289,9 +303,7 @@ class TKey(ABC):
 
     def send(
         self,
-        cmd_id: int,
-        cmd_len_idx: int,
-        eid: int,
+        cmd: Cmd,
         data: bytes = b"",
         timeout: int = -1,
     ) -> bytes:
@@ -303,16 +315,14 @@ class TKey(ABC):
         if timeout >= 0:
             self._conn.timeout = timeout
         try:
-            return self._send(cmd_id, cmd_len_idx, eid, data)
+            return self._send(cmd, data)
         finally:
             if timeout >= 0:
                 self._conn.timeout = old_timeout
 
     def _send(
         self,
-        cmd_id: int,
-        cmd_len_idx: int,
-        eid: int,
+        cmd: Cmd,
         data: bytes = b"",
     ) -> bytes:
         if self._conn is None:
@@ -320,14 +330,14 @@ class TKey(ABC):
 
         fid = self._next_fid()
 
-        expected_len = PROTO_DATA_LENGTH[cmd_len_idx]
+        expected_len = PROTO_DATA_LENGTH[cmd.len_idx]
         if len(data) > expected_len - 1:
             raise TKeyProtocolError("Data exceeds command data length in header")
 
-        header = (fid << 5) | (eid << 3) | cmd_len_idx
+        header = (fid << 5) | (cmd.endpoint << 3) | cmd.len_idx
         frame = bytearray(1 + expected_len)
         frame[0] = header
-        frame[1] = cmd_id
+        frame[1] = cmd.id
         if data:
             frame[2 : 2 + len(data)] = data
 
@@ -367,42 +377,23 @@ class TKey(ABC):
             raise TKeyProtocolError("Unexpected response data length")
 
         # Validate frame ID and endpoint
-        if resp_fid != fid or resp_eid != eid:
+        if resp_fid != fid or resp_eid != cmd.endpoint:
             raise TKeyProtocolError(
-                f"Response mismatch: expected Frame ID {fid} and Endpoint {eid}, "
-                f"got Frame ID {resp_fid} and Endpoint {resp_eid}"
+                f"Response mismatch: expected Frame ID {fid} and Endpoint "
+                f"{cmd.endpoint}, got Frame ID {resp_fid} and Endpoint {resp_eid}"
             )
 
-        self.validate_response(resp_eid, cmd_id, resp_data[0], resp_len_idx)
+        rsp = Rsp(resp_data[0], resp_len_idx)
+        if rsp not in cmd.valid_responses:
+            raise TKeyProtocolError(
+                f"Unexpected protocol response for cmd {cmd.id:#x} on endpoint "
+                f"{cmd.endpoint}: response={rsp.id:#x}, len_index={rsp.len_idx}"
+            )
 
         response = bytearray(1 + resp_len)
         response[0] = header_val
         response[1:] = resp_data
         return bytes(response)
-
-    @abstractmethod
-    def validate_response(
-        self, eid: int, cmd_id: int, resp_id: int, resp_len_idx: int
-    ) -> None: ...
-
-    def validate_firmware_response(
-        self, cmd_id: int, resp_id: int, resp_len_idx: int
-    ) -> None:
-        """Validate firmware response ID and length index matches expected response."""
-        match (cmd_id, resp_id, resp_len_idx):
-            case (FwCmd.NAME_VERSION, FwRsp.NAME_VERSION, LenIdx.I32):
-                pass
-            case (FwCmd.LOAD_APP, FwRsp.LOAD_APP, LenIdx.I4):
-                pass
-            case (FwCmd.LOAD_APP_DATA, FwRsp.LOAD_APP_DATA, LenIdx.I4):
-                pass
-            case (FwCmd.LOAD_APP_DATA, FwRsp.LOAD_APP_DATA_READY, LenIdx.I128):
-                pass
-            case (_, _, _):
-                raise TKeyProtocolError(
-                    f"Unexpected firmware protocol response: cmd={cmd_id:#x},"
-                    f" response={resp_id:#x}, len_index={resp_len_idx}"
-                )
 
     def load_app(self, app_binary: bytes, secret: str | None = None) -> bool:
         """
@@ -417,7 +408,7 @@ class TKey(ABC):
 
         try:
             # Query firmware name
-            rx = self.send(FwCmd.NAME_VERSION, 0, ENDPOINT_FW)
+            rx = self.send(FwCmd.NAME_VERSION)
         except TKeyError:
             # Not in firmware mode
             # TODO would be nice to only do this on NOK response, not other errors
@@ -431,7 +422,6 @@ class TKey(ABC):
 
         file_digest = hashlib.blake2s(app_binary, digest_size=32).digest()
 
-        # cmdLoadApp ID 0x03, length index 3 (128 bytes)
         data = bytearray(127)
         data[0:4] = file_size.to_bytes(4, byteorder="little")
         if secret is not None:
@@ -439,7 +429,7 @@ class TKey(ABC):
             uss = hashlib.blake2s(secret.encode("utf-8"), digest_size=32)
             data[5 : 5 + 32] = uss.digest()
 
-        response = self.send(FwCmd.LOAD_APP, 3, ENDPOINT_FW, bytes(data))
+        response = self.send(FwCmd.LOAD_APP, bytes(data))
         if response[2] == 1:
             raise TKeyAppError("Device not ready (STATUS_BAD)")
 
@@ -456,21 +446,18 @@ class TKey(ABC):
         return True
 
     def _load_app_data(self, file_data: bytes) -> bytes:
-        # cmdLoadAppData ID 0x05, length index 3 (128 bytes)
         digest = b""
         offset = 0
         while offset < len(file_data):
             chunk = file_data[offset : offset + 127]
-            response = self.send(FwCmd.LOAD_APP_DATA, 3, ENDPOINT_FW, chunk)
+            response = self.send(FwCmd.LOAD_APP_DATA, chunk)
             response_id = response[1]
             status = response[2]
             if status == 1:
                 raise TKeyError("Bad status when writing app data")
 
-            if response_id == FwRsp.LOAD_APP_DATA_READY:
+            if response_id == FwRsp.LOAD_APP_DATA_READY.id:
                 digest = response[3:35]
-            elif response_id != FwRsp.LOAD_APP_DATA:
-                raise TKeyProtocolError(f"Unexpected response code {response_id}")
 
             offset += 127
 
