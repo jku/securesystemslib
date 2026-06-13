@@ -289,6 +289,9 @@ class TKey:
                 logger.debug("Failed to close TKey connection: %s", e)
             self._conn = None
 
+    def __del__(self) -> None:
+        self.disconnect()
+
     def __enter__(self: _TKey) -> _TKey:
         return self
 
