@@ -16,7 +16,7 @@ from securesystemslib.signer._signer import SecretsHandler, Signer
 
 TKEY_IMPORT_ERROR = None
 try:
-    from securesystemslib.signer._tkey import TKeyMldsa
+    from securesystemslib.signer._tkey import SignApp, TKeySign
 except ImportError as e:
     TKEY_IMPORT_ERROR = f"TKeySigner: {e}"
 
@@ -58,7 +58,7 @@ class TKeySigner(Signer):
         self._public_key = public_key
 
         passphrase = secrets_handler("Passphrase") if secrets_handler else None
-        self._tkey = TKeyMldsa(device_path, self._get_app(version), version, passphrase)
+        self._tkey = TKeySign(device_path, self._get_app(version), passphrase)
 
         # key derivation depends on passphrase: compare keys to make sure
         raw_pubkey = self._tkey.get_pubkey()
@@ -69,11 +69,11 @@ class TKeySigner(Signer):
             )
 
     @staticmethod
-    def _get_app(version: int) -> bytes:
+    def _get_app(version: int) -> SignApp:
         app_resource = files("securesystemslib.signer._tkey").joinpath(
-            f"app_v{version}.bin"
+            f"mldsa_v{version}.bin"
         )
-        return app_resource.read_bytes()
+        return SignApp.mldsa(app_resource.read_bytes(), version)
 
     @property
     def public_key(self) -> SSlibKey:
@@ -138,7 +138,7 @@ class TKeySigner(Signer):
         if TKEY_IMPORT_ERROR:
             raise UnsupportedLibraryError(TKEY_IMPORT_ERROR)
 
-        with TKeyMldsa(device_path, cls._get_app(version), version, passphrase) as tk:
+        with TKeySign(device_path, cls._get_app(version), passphrase) as tk:
             raw_pubkey = tk.get_pubkey()
 
         key = SSlibKey.from_crypto(MLDSA44PublicKey.from_public_bytes(raw_pubkey))

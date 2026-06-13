@@ -1,6 +1,6 @@
-"""Tillitis TKey Signer base
+"""Tillitis TKey
 
-This class is used to build host/client applications for a TKey signer.
+This class is used to build host/client applications for a Tillitis TKey.
 It implements the Firmware protocol and provides serial IO as well
 as some helpers for the actual application implementation.
 
@@ -65,6 +65,8 @@ class Cmd:
 
 
 class FwRsp:
+    """Firmware responses"""
+
     NAME_VERSION = Rsp(0x02, LenIdx.I32)
     LOAD_APP = Rsp(0x04, LenIdx.I4)
     LOAD_APP_DATA = Rsp(0x06, LenIdx.I4)
@@ -72,6 +74,8 @@ class FwRsp:
 
 
 class FwCmd:
+    """Firmware commands"""
+
     NAME_VERSION = Cmd(0x01, 2, LenIdx.I1, (FwRsp.NAME_VERSION,))
     LOAD_APP = Cmd(0x03, 2, LenIdx.I128, (FwRsp.LOAD_APP,))
     LOAD_APP_DATA = Cmd(
@@ -87,7 +91,7 @@ class TKeyError(Exception):
 
 
 class TKeyAppError(TKeyError):
-    """Raised when loading the signer application fails."""
+    """Raised when loading the application fails."""
 
 
 class TKeyIOError(TKeyError):
@@ -301,12 +305,7 @@ class TKey:
         self._fid = (self._fid + 1) % 4
         return self._fid
 
-    def send(
-        self,
-        cmd: Cmd,
-        data: bytes = b"",
-        timeout: int = -1,
-    ) -> bytes:
+    def send(self, cmd: Cmd, data: bytes = b"", timeout: int = -1) -> bytes:
         """Frame and send a command, then read and validate the response."""
         if self._conn is None:
             raise TKeyError("TKey is not connected")
@@ -320,11 +319,7 @@ class TKey:
             if timeout >= 0:
                 self._conn.timeout = old_timeout
 
-    def _send(
-        self,
-        cmd: Cmd,
-        data: bytes = b"",
-    ) -> bytes:
+    def _send(self, cmd: Cmd, data: bytes = b"") -> bytes:
         if self._conn is None:
             raise TKeyError("TKey is not connected")
 
