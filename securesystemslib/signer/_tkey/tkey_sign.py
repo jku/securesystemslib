@@ -41,6 +41,10 @@ class SignApp:
     def mldsa(cls, binary: bytes, version: int) -> SignApp:
         return cls(("tk1", "mlds"), 2420, 1312, binary, version)
 
+    @classmethod
+    def ed25519(cls, binary: bytes, version: int) -> SignApp:
+        return cls(("tk1", "sign"), 64, 32, binary, version)
+
 
 class SignRsp:
     """Application responses"""
