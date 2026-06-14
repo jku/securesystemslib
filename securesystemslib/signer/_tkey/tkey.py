@@ -267,13 +267,24 @@ class TKey:
                 raise TKeyError("No TKey devices found")
             device_path = devices[0]
         elif device_path not in devices:
-            raise TKeyError(f"TKey device {device_path} not found")
+            logger.warning(
+                "Using explicitly provided device path that is not a recognized TKey USB device."
+            )
         return device_path
 
     def _connect(self, device: str | None, baudrate: int, timeout: float) -> None:
         port = self._find_device(device)
 
-        if sys.platform == "linux":
+        if port.startswith("socket://") or port.startswith("rfc2217://"):
+            # special case pyserial remote schemes: great for emulators and remote HW
+            try:
+                self._conn = serial.serial_for_url(
+                    port, baudrate=baudrate, timeout=timeout
+                )
+            except Exception as e:
+                raise TKeyError(f"Failed to open virtual port {port}: {e}") from e
+        elif sys.platform == "linux":
+            # pyserial has issues with custom baudrate on linux: work around
             self._conn = _RawSerialConnection(port, baudrate, timeout)
         else:
             try:

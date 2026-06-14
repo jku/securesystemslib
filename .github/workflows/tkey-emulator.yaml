@@ -1,0 +1,138 @@
+name: TKey Emulator Cross-Platform CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # Extracts the firmware from the Tillitis OCI image
+  extract-firmware:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Extract tkey-firmware-noconsole.elf from OCI image
+        run: |
+          docker create --name tkey-tmp ghcr.io/tillitis/tkey-qemu-tk1-23.03.1:latest
+          docker export tkey-tmp | tar xf - tkey-firmware-noconsole.elf
+          find . -name "tkey-firmware-noconsole.elf" -exec mv {} ./tkey-firmware-noconsole.elf \;
+          docker rm tkey-tmp
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tkey-firmware
+          path: tkey-firmware-noconsole.elf
+
+  test-emulator:
+    needs: extract-firmware
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install PySerial and dependencies
+        run: pip install -e .[tkey]
+
+      # OS-specific QEMU build dependencies
+      - name: Install QEMU build deps (Ubuntu)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ninja-build pkg-config libglib2.0-dev libpixman-1-dev
+
+      - name: Install QEMU build deps (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja pkg-config glib pixman
+
+      - name: Setup MSYS2 (Windows)
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            git make mingw-w64-x86_64-gcc mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-pkgconf mingw-w64-x86_64-glib2
+            mingw-w64-x86_64-pixman mingw-w64-x86_64-python
+            mingw-w64-x86_64-python-pip mingw-w64-x86_64-meson diffutils
+
+      - name: Cache QEMU
+        id: cache-qemu
+        uses: actions/cache@v3
+        with:
+          path: qemu/build
+          # Bump the key version if you need to force a rebuild
+          key: ${{ runner.os }}-qemu-tk1-v1
+
+      - name: Build Tillitis QEMU (macOS / Linux)
+        if: steps.cache-qemu.outputs.cache-hit != 'true' && runner.os != 'Windows'
+        shell: bash
+        run: |
+          git clone -b tk1 https://github.com/tillitis/qemu
+          cd qemu
+          mkdir -p build && cd build
+          ../configure --target-list=riscv32-softmmu --disable-werror
+          make -j $(nproc || sysctl -n hw.ncpu || echo 2) qemu-system-riscv32
+
+      - name: Build Tillitis QEMU (Windows)
+        if: steps.cache-qemu.outputs.cache-hit != 'true' && runner.os == 'Windows'
+        shell: msys2 {0}
+        run: |
+          git clone -b tk1 https://github.com/tillitis/qemu
+          cd qemu
+          mkdir -p build && cd build
+          ../configure --target-list=riscv32-softmmu --disable-werror --python=/mingw64/bin/python3
+          make -j $(nproc || sysctl -n hw.ncpu || echo 2) qemu-system-riscv32.exe
+
+      - name: Download firmware artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tkey-firmware
+
+      - name: Start TKey Emulator (macOS / Linux)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          QEMU_BIN="qemu/build/qemu-system-riscv32"
+          $QEMU_BIN -nographic -M tk1,fifo=chrid -bios tkey-firmware-noconsole.elf -chardev socket,id=chrid,host=127.0.0.1,port=1234,server=on,wait=off &
+          sleep 2
+
+      - name: Start TKey Emulator (Windows)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: |
+          QEMU_BIN="qemu/build/qemu-system-riscv32.exe"
+          $QEMU_BIN -nographic -M tk1,fifo=chrid -bios tkey-firmware-noconsole.elf -chardev socket,id=chrid,host=127.0.0.1,port=1234,server=on,wait=off &
+          sleep 2
+
+      - name: Run Test Script
+        shell: bash
+        run: |
+          cat > test-tkey-mldsa.py << 'EOF'
+          from securesystemslib.signer._tkey import SignApp, TKeySign
+          from cryptography.hazmat.primitives.asymmetric.mldsa import MLDSA44PublicKey
+
+          bin = open("securesystemslib/signer/_tkey/mldsa_v4.bin", "rb").read()
+          signer = TKeySign(
+              SignApp.mldsa(bin, 4),
+              device="socket://127.0.0.1:1234",
+              secret="hunter2"
+          )
+
+          raw_pubkey = signer.get_pubkey()
+
+          # Sign payload
+          payload = b"payload"
+          sig = signer.sign(payload)
+
+          # Verify signature
+          pubkey = MLDSA44PublicKey.from_public_bytes(raw_pubkey)
+          pubkey.verify(sig, payload)
+          print("Verification successful!")
+          EOF
+
+          python test-tkey-mldsa.py
