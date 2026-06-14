@@ -58,7 +58,7 @@ class TKeySigner(Signer):
         self._public_key = public_key
 
         passphrase = secrets_handler("Passphrase") if secrets_handler else None
-        self._tkey = TKeySign(device_path, self._get_app(version), passphrase)
+        self._tkey = TKeySign(self._get_app(version), device_path, passphrase)
 
         # key derivation depends on passphrase: compare keys to make sure
         raw_pubkey = self._tkey.get_pubkey()
@@ -138,7 +138,7 @@ class TKeySigner(Signer):
         if TKEY_IMPORT_ERROR:
             raise UnsupportedLibraryError(TKEY_IMPORT_ERROR)
 
-        with TKeySign(device_path, cls._get_app(version), passphrase) as tk:
+        with TKeySign(cls._get_app(version), device_path, passphrase) as tk:
             raw_pubkey = tk.get_pubkey()
 
         key = SSlibKey.from_crypto(MLDSA44PublicKey.from_public_bytes(raw_pubkey))

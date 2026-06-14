@@ -73,8 +73,8 @@ class TKeySign(TKey):
 
     def __init__(
         self,
-        device: str | None,
         app: SignApp,
+        device: str | None,
         secret: str | None,
     ) -> None:
         super().__init__(device)
