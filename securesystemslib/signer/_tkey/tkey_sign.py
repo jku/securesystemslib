@@ -2,7 +2,7 @@
 
 This class implements a host application for a TKey signer. The design supports
 a specific application protocol (see SignCmd) but allows for different device
-applications for different signing algorithms. Only a ML-DSA signer is
+applications for different signing algorithms. ML-DSA and ed25519 signers are
 currently defined.
 
 The binary comes from https://github.com/jku/tkey-device-signer/tree/mldsa
