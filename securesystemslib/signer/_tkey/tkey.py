@@ -355,7 +355,7 @@ class TKey:
         header_val = resp_header_byte[0]
         resp_fid = (header_val >> 5) & 3
         resp_eid = (header_val >> 3) & 3
-        resp_status = (header_val >> 2) & 3
+        resp_status = (header_val >> 2) & 1
         resp_len_idx = header_val & 3
         resp_len = PROTO_DATA_LENGTH[resp_len_idx]
 
