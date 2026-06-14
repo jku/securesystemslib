@@ -13,13 +13,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
-from securesystemslib.signer._tkey.tkey import (
-    Cmd,
-    LenIdx,
-    Rsp,
-    TKey,
-    TKeyError,
-)
+from securesystemslib.signer._tkey.tkey import Cmd, LenIdx, Rsp, TKey, TKeyError
 
 logger = logging.getLogger(__name__)
 
