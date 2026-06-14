@@ -17,7 +17,7 @@ jobs:
           find . -name "tkey-firmware-noconsole.elf" -exec mv {} ./tkey-firmware-noconsole.elf \;
           docker rm tkey-tmp
       - name: Upload firmware artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: tkey-firmware
           path: tkey-firmware-noconsole.elf
@@ -30,9 +30,9 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
@@ -50,7 +50,7 @@ jobs:
 
       - name: Setup MSYS2 (Windows)
         if: runner.os == 'Windows'
-        uses: msys2/setup-msys2@v2
+        uses: msys2/setup-msys2@v2.31.1
         with:
           msystem: MINGW64
           update: true
@@ -61,7 +61,7 @@ jobs:
 
       - name: Cache QEMU
         id: cache-qemu
-        uses: actions/cache@v3
+        uses: actions/cache@v5
         with:
           path: qemu/build
           # Bump the key version if you need to force a rebuild
@@ -78,7 +78,7 @@ jobs:
           make -j $(nproc || sysctl -n hw.ncpu || echo 2) qemu-system-riscv32
 
       - name: Download firmware artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: tkey-firmware
 
