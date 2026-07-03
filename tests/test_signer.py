@@ -714,19 +714,45 @@ class TestCryptoSigner(unittest.TestCase):
     def test_generate(self):
         """Test generate and use signer (key pair) for each sslib keytype"""
         test_data = [
-            (CryptoSigner.generate_rsa, "rsa", "rsassa-pss-sha256"),
-            (CryptoSigner.generate_ecdsa, "ecdsa", "ecdsa-sha2-nistp256"),
-            (CryptoSigner.generate_ed25519, "ed25519", "ed25519"),
+            (
+                CryptoSigner.generate_rsa,
+                "rsa",
+                [
+                    "rsassa-pss-sha224",
+                    "rsassa-pss-sha256",
+                    "rsassa-pss-sha384",
+                    "rsassa-pss-sha512",
+                    "rsa-pkcs1v15-sha224",
+                    "rsa-pkcs1v15-sha256",
+                    "rsa-pkcs1v15-sha384",
+                    "rsa-pkcs1v15-sha512",
+                ],
+            ),
+            (
+                CryptoSigner.generate_ecdsa,
+                "ecdsa",
+                [
+                    "ecdsa-sha2-nistp256",
+                    "ecdsa-sha2-nistp384",
+                    "ecdsa-sha2-nistp521",
+                ],
+            ),
+            (CryptoSigner.generate_ed25519, "ed25519", ["ed25519"]),
         ]
-        for generate, keytype, default_scheme in test_data:
-            signer = generate()
-            self.assertEqual(signer.public_key.keytype, keytype)
-            self.assertEqual(signer.public_key.scheme, default_scheme)
+        for generate, keytype, schemes in test_data:
+            for scheme in schemes:
+                if keytype == "ed25519":
+                    signer = generate()
+                else:
+                    signer = generate(scheme=scheme)
 
-            sig = signer.sign(b"DATA")
-            self.assertIsNone(signer.public_key.verify_signature(sig, b"DATA"))
-            with self.assertRaises(UnverifiedSignatureError):
-                signer.public_key.verify_signature(sig, b"NOT DATA")
+                self.assertEqual(signer.public_key.keytype, keytype)
+                self.assertEqual(signer.public_key.scheme, scheme)
+
+                sig = signer.sign(b"DATA")
+                self.assertIsNone(signer.public_key.verify_signature(sig, b"DATA"))
+                with self.assertRaises(UnverifiedSignatureError):
+                    signer.public_key.verify_signature(sig, b"NOT DATA")
 
     def test_private_bytes(self):
         """Test private_bytes -> from_priv_key_uri"""

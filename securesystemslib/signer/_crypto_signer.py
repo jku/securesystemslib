@@ -15,6 +15,8 @@ try:
     from cryptography.hazmat.primitives.asymmetric.ec import (
         ECDSA,
         SECP256R1,
+        SECP384R1,
+        SECP521R1,
         EllipticCurvePrivateKey,
     )
     from cryptography.hazmat.primitives.asymmetric.ec import (
@@ -36,10 +38,7 @@ try:
         generate_private_key as generate_rsa_private_key,
     )
     from cryptography.hazmat.primitives.asymmetric.types import PrivateKeyTypes
-    from cryptography.hazmat.primitives.hashes import (
-        SHA256,
-        HashAlgorithm,
-    )
+    from cryptography.hazmat.primitives.hashes import HashAlgorithm
     from cryptography.hazmat.primitives.serialization import (
         Encoding,
         NoEncryption,
@@ -148,15 +147,18 @@ class CryptoSigner(Signer):
             self._sign_args = _RSASignArgs(padding, hash_algo)
             self._private_key = private_key
 
-        elif (
-            public_key.keytype in _ECDSA_KEYTYPES
-            and public_key.scheme == "ecdsa-sha2-nistp256"
-        ):
+        elif public_key.keytype in _ECDSA_KEYTYPES and public_key.scheme in [
+            "ecdsa-sha2-nistp256",
+            "ecdsa-sha2-nistp384",
+            "ecdsa-sha2-nistp521",
+        ]:
             if not isinstance(private_key, EllipticCurvePrivateKey):
                 raise ValueError(f"invalid ecdsa key: {type(private_key)}")
 
-            signature_algorithm = ECDSA(SHA256())
-            self._sign_args = _ECDSASignArgs(signature_algorithm)
+            hash_name = public_key.get_hash_algorithm_name()
+            hash_algo = get_hash_algorithm(hash_name)
+
+            self._sign_args = _ECDSASignArgs(ECDSA(hash_algo))
             self._private_key = private_key
 
         elif public_key.keytype == "ed25519" and public_key.scheme == "ed25519":
@@ -298,13 +300,13 @@ class CryptoSigner(Signer):
 
     @staticmethod
     def generate_ecdsa(
-        keyid: str | None = None,
+        keyid: str | None = None, scheme: str | None = None
     ) -> "CryptoSigner":
-        """Generate new key pair as "ecdsa-sha2-nistp256" signer.
+        """Generate new key pair for a Ecdsa signer.
 
         Args:
             keyid: Key identifier. If not passed, a default keyid is computed.
-
+            scheme: ECDSA scheme. Default is "ecdsa-sha2-nistp256"
         Raises:
             UnsupportedLibraryError: pyca/cryptography not installed
 
@@ -314,10 +316,17 @@ class CryptoSigner(Signer):
         if CRYPTO_IMPORT_ERROR:
             raise UnsupportedLibraryError(CRYPTO_IMPORT_ERROR)
 
-        private_key = generate_ec_private_key(SECP256R1())
-        public_key = SSlibKey.from_crypto(
-            private_key.public_key(), keyid, "ecdsa-sha2-nistp256"
-        )
+        scheme = "ecdsa-sha2-nistp256" if scheme is None else scheme
+        if scheme == "ecdsa-sha2-nistp256":
+            private_key = generate_ec_private_key(SECP256R1())
+        elif scheme == "ecdsa-sha2-nistp384":
+            private_key = generate_ec_private_key(SECP384R1())
+        elif scheme == "ecdsa-sha2-nistp521":
+            private_key = generate_ec_private_key(SECP521R1())
+        else:
+            raise ValueError(f"Unsupported scheme {scheme}")
+
+        public_key = SSlibKey.from_crypto(private_key.public_key(), keyid, scheme)
         return CryptoSigner(private_key, public_key)
 
     def sign(self, payload: bytes) -> Signature:
